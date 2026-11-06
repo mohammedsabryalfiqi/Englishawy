@@ -56,9 +56,11 @@ def _ui_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
 
 
 def _font_for(path: str, size: int, face_index: int = 0) -> ImageFont.FreeTypeFont | None:
+    if not path or not Path(path).is_file():
+        return None
     try:
         return ImageFont.truetype(path, size, index=face_index)
-    except Exception:
+    except (OSError, ValueError):
         return None
 
 
@@ -92,8 +94,35 @@ def _fit_preview(text: str, font_path: str, max_w: int, max_h: int, face_index: 
     return img
 
 
+def _fit_provider_preview(image: Image.Image, max_w: int, max_h: int) -> Image.Image:
+    """Fit a validated provider rendering, trimming its white paper margin."""
+    image = image.convert("RGB")
+    ink = np.min(np.asarray(image), axis=2) < 235
+    ys, xs = np.where(ink)
+    if len(xs):
+        image = image.crop((max(0, int(xs.min()) - 4), max(0, int(ys.min()) - 4),
+                            min(image.width, int(xs.max()) + 5), min(image.height, int(ys.max()) + 5)))
+    scale = min(max_w / max(1, image.width), max_h / max(1, image.height))
+    return image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+                        Image.Resampling.LANCZOS)
+
+
 def _round_rect(draw: ImageDraw.ImageDraw, xy, r, fill):
     draw.rounded_rectangle(xy, radius=r, fill=fill)
+
+
+def _truncate(draw: ImageDraw.ImageDraw, text: str, font, max_w: float) -> str:
+    """Ellipsize by measured width so the ellipsis itself cannot overlap a badge."""
+    if max_w <= 0:
+        return ""
+    if draw.textlength(text, font=font) <= max_w:
+        return text
+    ellipsis = "…"
+    limit = max_w - draw.textlength(ellipsis, font=font)
+    out = text
+    while out and draw.textlength(out, font=font) > limit:
+        out = out[:-1]
+    return out.rstrip() + ellipsis
 
 
 def render_card(
@@ -104,7 +133,7 @@ def render_card(
     ocr_confidence: float | None = None,
 ) -> bytes:
     matches = matches[:top_n]
-    row_h = 104
+    row_h = 120
     header_h = 84
     crop_panel_h = 150
     gap = 14
@@ -161,28 +190,37 @@ def render_card(
         nw = d.textlength(num, font=nf)
         d.text((nx + (nb - nw) / 2, ny + 9), num, font=nf, fill=(15, 118, 110))
         # اسم الخط
-        family = getattr(m, "family", str(m))
-        family_text = family if len(family) <= 43 else family[:40] + "…"
-        d.text((nx + nb + 16, y + 16), family_text, font=name_f, fill=INK)
-        source = getattr(m, "source", "google")
-        badge_text = "OWNER LIBRARY" if source == "owner" else "GOOGLE FONTS"
+        family = str(getattr(m, "family", str(m)))
+        source = str(getattr(m, "source", "google"))
+        badge_text = ("OWNER LIBRARY" if source == "owner" else
+                      "WHATFONTIS" if source.endswith("WhatFontIs") else
+                      "WHATTHEFONT" if source.endswith("WhatTheFont") else "GOOGLE FONTS")
         badge_font = _ui_font(10, True)
         badge_w = d.textlength(badge_text, font=badge_font) + 16
         d.rounded_rectangle((W - MARGIN - badge_w - 16, y + 15, W - MARGIN - 16, y + 35), radius=8, fill=TEAL_SOFT)
         d.text((W - MARGIN - badge_w - 8, y + 19), badge_text, font=badge_font, fill=(15, 118, 110))
-        # المعاينة الحيّة
+        name_x = nx + nb + 16
+        name_limit = W - MARGIN - badge_w - 32 - name_x
+        family_text = _truncate(d, family, name_f, name_limit)
+        d.text((name_x, y + 16), family_text, font=name_f, fill=INK)
+        # معاينة الكلمة نفسها: ملف محلي مطابق، أو صورة النص من مزود التعرف.
         preview = _fit_preview(text, getattr(m, "font_path", ""), INNER - 110, row_h - 52, getattr(m, "face_index", 0))
+        paste_mask = preview
+        provider_image = getattr(m, "preview_image", None)
+        if preview is None and provider_image is not None:
+            preview = _fit_provider_preview(provider_image, INNER - 110, row_h - 52)
+            paste_mask = None
         if preview is not None:
             px = nx + nb + 16
             py = y + 46 + (row_h - 52 - preview.height) // 2
-            img.paste(preview, (px, py), preview)
+            img.paste(preview, (px, py), paste_mask)
         else:
-            d.text((nx + nb + 16, y + 58), "Preview unavailable", font=prev_missing_f, fill=MUTED)
+            d.text((nx + nb + 16, y + 64), "Preview unavailable", font=prev_missing_f, fill=MUTED)
         y += row_h + gap
 
     # ---- تذييل ----
     fy = y + 2
-    note = "Tesseract OCR  ·  Google + Owner fonts  ·  DINOv₂ rerank"
+    note = "Font names + live previews  ·  No download links"
     d.text((MARGIN, fy), note, font=_ui_font(12), fill=(120, 135, 158))
 
     buf = io.BytesIO()

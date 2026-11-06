@@ -25,16 +25,19 @@ import json
 import logging
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+
+from config import cascade_threshold, whatfontis_api_key
 
 logger = logging.getLogger(__name__)
 
 WHATTHEFONT_URL = "https://www.myfonts.com/pages/whatthefont"
 WHATFONTIS_URL = "https://www.whatfontis.com/"
 WHATFONTIS_API_ENDPOINT = "https://www.whatfontis.com/api2/"
-CASCADE_THRESHOLD = float(os.getenv("CASCADE_THRESHOLD", "0.78"))
+CASCADE_THRESHOLD = cascade_threshold()
 
 
 @dataclass
@@ -45,6 +48,7 @@ class ExternalMatch:
     source_url: str = WHATTHEFONT_URL
     score: float = 0.0                   # 0..1
     final_score: float = 0.0             # 0..1 (same scale, kept for pipeline compat)
+    preview_images: tuple[str, ...] = ()  # provider specimens; not the user's word
 
 
 @dataclass
@@ -57,6 +61,7 @@ class CascadeReport:
     winning_stage: str = "owner_library"  # whatthefont | whatfontis | owner_library
     matches: list[ExternalMatch] = field(default_factory=list)
     timings: dict = field(default_factory=dict)
+    notices: list[str] = field(default_factory=list)
 
 
 def _post_form(url: str, fields: dict, timeout: int) -> bytes:
@@ -129,16 +134,19 @@ def query_whatthefont(image_bytes: bytes, ocr_text: str = "", timeout: int = 12)
         return []
 
 
-def query_whatfontis(image_bytes: bytes, ocr_text: str = "", timeout: int = 15) -> list[ExternalMatch]:
+def query_whatfontis(image_bytes: bytes, ocr_text: str = "", timeout: int = 15,
+                     report: CascadeReport | None = None) -> list[ExternalMatch]:
     """Step 2 — WhatFontIs official api2 (second option). Needs WHATFONTIS_API_KEY.
 
     Get a free key after login at:
       https://www.whatfontis.com/API-identify-fonts-from-image.html
     """
     _ = ocr_text
-    api_key = os.getenv("WHATFONTIS_API_KEY", "").strip()
+    api_key = whatfontis_api_key()
     if not api_key:
-        logger.info("WhatFontIs: WHATFONTIS_API_KEY not set, skipping.")
+        logger.info("WhatFontIs: API key not set, skipping.")
+        if report is not None:
+            report.notices.append("مفتاح WhatFontIs غير مضبوط")
         return []
     try:
         b64 = base64.b64encode(image_bytes).decode("ascii")
@@ -153,9 +161,14 @@ def query_whatfontis(image_bytes: bytes, ocr_text: str = "", timeout: int = 15) 
         }, timeout=timeout)
         data = json.loads(raw.decode("utf-8", errors="ignore"))
         if isinstance(data, dict) and data.get("error"):
-            logger.info("WhatFontIs API error: %s", str(data.get("error"))[:160])
+            # Provider errors may echo request data. Log only a safe category.
+            logger.warning("WhatFontIs API returned an error response")
+            if report is not None:
+                report.notices.append("WhatFontIs رفض الطلب؛ راجع المفتاح/الرصيد")
             return []
         if not isinstance(data, list):
+            if report is not None:
+                report.notices.append("رد غير متوقع من WhatFontIs")
             return []
         out: list[ExternalMatch] = []
         for idx, item in enumerate(data[:5]):
@@ -166,11 +179,22 @@ def query_whatfontis(image_bytes: bytes, ocr_text: str = "", timeout: int = 15) 
                 continue
             page = str(item.get("url") or WHATFONTIS_URL)
             score = max(0.60, 0.90 - idx * 0.04)  # api2 returns best-first, no scores
+            specimens = tuple(str(item[k]) for k in ("image", "image1", "image2")
+                              if isinstance(item.get(k), str) and item[k].startswith("https://"))
             out.append(ExternalMatch(family=title, style="Regular", source="WhatFontIs",
-                                     source_url=page, score=score, final_score=score))
+                                     source_url=page, score=score, final_score=score,
+                                     preview_images=specimens))
         return out
+    except urllib.error.HTTPError as exc:
+        logger.warning("WhatFontIs HTTP status: %s", exc.code)
+        if report is not None:
+            hint = "انتهى رصيد/حد طلبات WhatFontIs" if exc.code == 429 else "تعذر اتصال WhatFontIs؛ راجع المفتاح أو الشبكة"
+            report.notices.append(hint)
+        return []
     except Exception as exc:
         logger.info("WhatFontIs query fallback: %s", type(exc).__name__)
+        if report is not None:
+            report.notices.append("تعذر الاتصال بـ WhatFontIs")
         return []
 
 
@@ -185,7 +209,7 @@ def search_external_first(image_bytes: bytes, ocr_text: str = "",
     report.whatthefont_best = max((m.final_score for m in wtf), default=0.0)
 
     t1 = time.time()
-    wfi = query_whatfontis(image_bytes, ocr_text=ocr_text)
+    wfi = query_whatfontis(image_bytes, ocr_text=ocr_text, report=report)
     report.timings["whatfontis"] = round(time.time() - t1, 2)
     report.whatfontis_tried = True
     report.whatfontis_best = max((m.final_score for m in wfi), default=0.0)

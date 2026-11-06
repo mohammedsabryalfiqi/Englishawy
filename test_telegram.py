@@ -49,20 +49,24 @@ async def _non_owner_case(tmp_path):
     assert "للمالك فقط" in replies[0]
 
 
-def test_image_sessions_awaiting_does_not_deadlock():
+def test_image_sessions_busy_and_tokens_are_thread_safe():
     import threading
     from services import ImageSessions
 
     sessions = ImageSessions()
-    sessions.put((1, 1), b"img")
+    token = sessions.put((1, 1), b"img")
+    results = []
 
     def work():
-        sessions.awaiting((1, 1), True)
-        assert sessions.is_awaiting((1, 1))
-        sessions.awaiting((1, 1), False)
-        assert not sessions.is_awaiting((1, 1))
+        results.append(sessions.begin((1, 1), token))
+        results.append(sessions.begin((1, 1), token))
+        sessions.finish((1, 1), token, "Question", True)
+        state = sessions.state((1, 1), token)
+        results.append(state is not None and state.owner_only and not state.busy)
+        results.append(sessions.state((1, 1), "stale") is None)
 
     thread = threading.Thread(target=work, daemon=True)
     thread.start()
     thread.join(3)
     assert not thread.is_alive(), "ImageSessions deadlocked (non re-entrant lock)"
+    assert results == [True, False, True, True]

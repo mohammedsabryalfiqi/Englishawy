@@ -1,4 +1,4 @@
-"""Telegram webhook mounted on the same FastAPI/Gradio port (no second public port)."""
+"""Telegram transport: long polling by default; optional webhook on Gradio's port."""
 from __future__ import annotations
 
 import asyncio
@@ -11,10 +11,10 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from telegram import Update
-from telegram.error import InvalidToken, NetworkError, TelegramError, TimedOut
+from telegram.error import Conflict, InvalidToken, NetworkError, TelegramError, TimedOut
 from telegram.ext import Application
 
-from bot import register_handlers
+from bot import post_init, register_handlers
 from config import public_base_url
 from services import Services
 
@@ -25,6 +25,8 @@ MAX_UPDATE_BYTES = 1024 * 1024  # JSON metadata only; files are downloaded separ
 
 def describe_telegram_error(exc: Exception) -> str:
     """Never include exception text that may embed the bot-token URL."""
+    if isinstance(exc, Conflict):
+        return "Conflict: نسخة أخرى تستهلك نفس التوكن؛ أوقف البوت المكرر ثم أعد التشغيل"
     if isinstance(exc, InvalidToken):
         return "InvalidToken: توكن البوت غير صحيح؛ راجع TELEGRAM_BOT_TOKEN في Space secrets"
     if isinstance(exc, TimedOut):
@@ -32,8 +34,8 @@ def describe_telegram_error(exc: Exception) -> str:
     if isinstance(exc, NetworkError):
         return "NetworkError: تعذر الوصول إلى api.telegram.org من الـSpace"
     if isinstance(exc, TelegramError):
-        return f"{type(exc).__name__}: رفضت Telegram الطلب؛ تحقق من التوكن وإعدادات Webhook"
-    return f"{type(exc).__name__}: تحقق من التوكن ورابط HTTPS والاتصال بتليجرام"
+        return f"{type(exc).__name__}: رفضت Telegram الطلب؛ تحقق من التوكن والصلاحيات وإعدادات الاتصال"
+    return f"{type(exc).__name__}: تحقق من التوكن والاتصال بتليجرام"
 
 
 class TelegramBridge:
@@ -45,7 +47,9 @@ class TelegramBridge:
             if not base_url.startswith("https://"):
                 raise ValueError("A public HTTPS URL is required for Telegram webhook mode")
         self.token, self.secret, self.base_url = token, secret, base_url
-        builder = Application.builder().token(token).concurrent_updates(4)
+        builder = (Application.builder().token(token).concurrent_updates(4)
+                   .post_init(post_init).connect_timeout(15).read_timeout(30)
+                   .write_timeout(30).pool_timeout(15).get_updates_read_timeout(35))
         if mode == "webhook":
             builder = builder.updater(None)  # polling mode keeps the default Updater
         self.application = builder.build()
@@ -66,7 +70,7 @@ class TelegramBridge:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
             return None
-        mode = os.getenv("TELEGRAM_MODE", "webhook").strip().lower()
+        mode = os.getenv("TELEGRAM_MODE", "polling").strip().lower()
         if mode not in {"webhook", "polling"}:
             raise ValueError("TELEGRAM_MODE must be 'webhook' or 'polling'")
         base = public_base_url() if mode == "webhook" else ""
@@ -74,14 +78,21 @@ class TelegramBridge:
 
     async def start(self) -> None:
         await self.application.initialize()
+        # PTB only runs post_init automatically in run_polling/run_webhook.
+        # This bridge starts the Application manually, so invoke it here too.
+        callback = getattr(self.application, "post_init", None)
+        if callback is not None:
+            await callback(self.application)
         if self.mode == "polling":
             # Works on PRIVATE Spaces too: only outbound calls to api.telegram.org are needed.
             try:
-                await self.application.bot.delete_webhook(drop_pending_updates=True)
+                await self.application.bot.delete_webhook(drop_pending_updates=False)
                 await self.application.start()
                 await self.application.updater.start_polling(
-                    allowed_updates=["message", "callback_query"], drop_pending_updates=True)
+                    allowed_updates=["message", "callback_query"], drop_pending_updates=False,
+                    timeout=30, bootstrap_retries=-1, error_callback=self._polling_error)
                 self.started = True
+                self.error = ""
                 logger.info("Telegram polling started")
             except Exception:
                 await self.stop()
@@ -97,11 +108,17 @@ class TelegramBridge:
                 max_connections=40,
             )
             self.started = True
+            self.error = ""
             info = await self.webhook_info()
             logger.info("Telegram getWebhookInfo: %s", info)
         except Exception:
             await self.stop()
             raise
+
+    def _polling_error(self, exc: TelegramError) -> None:
+        # PTB calls this from the polling retry loop; never leak token-bearing text.
+        self.error = describe_telegram_error(exc)
+        logger.error("Telegram polling error: %s", self.error)
 
     async def _consumer(self) -> None:
         assert self.queue is not None
@@ -179,7 +196,11 @@ class TelegramBridge:
         return JSONResponse({"ok": True})
 
     def status(self) -> dict:
-        return {"configured": True, "connected": self.started, "mode": self.mode, "error": self.error,
+        connected = self.started
+        updater = getattr(self.application, "updater", None)
+        if self.mode == "polling" and updater is not None:
+            connected = connected and bool(updater.running)
+        return {"configured": True, "connected": connected, "mode": self.mode, "error": self.error,
                 "hits": self.hits, "accepted": self.accepted, "processed": self.processed,
                 "failed": self.failed, "last_reject": self.last_reject,
                 "last_hit_secs_ago": round(time.time() - self.last_hit_at) if self.last_hit_at else None}

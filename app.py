@@ -1,8 +1,8 @@
-"""Hugging Face Gradio/ZeroGPU entry point, with Telegram webhook on the same port.
+"""Hugging Face Gradio/ZeroGPU entry point; Telegram defaults to long polling.
 
-Local CPU preview: python app.py  (Gradio launch initializes upload/queue state)
-Space: Gradio launches `demo`; its underlying FastAPI app also serves /telegram/webhook.
-No max_file_size is configured: ZIP size is bounded only by real platform/disk limits.
+Local CPU preview: python app.py (one process serves Gradio and polls Telegram).
+TELEGRAM_MODE=webhook explicitly enables the optional /telegram/webhook route.
+Never run a second consumer with the same bot token. No application ZIP limit.
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ try:
 except ValueError as exc:
     bridge, bridge_error = None, str(exc)
 if bridge:
-    logger.info("Telegram token detected; webhook will be registered during Gradio startup.")
+    logger.info("Telegram token detected; %s will start with Gradio.", bridge.mode)
 else:
     logger.warning("Telegram bot disabled: %s", bridge_error or "TELEGRAM_BOT_TOKEN is not set in Space secrets")
 
@@ -81,9 +81,10 @@ def runtime_status() -> str:
     storage = storage_status()
     if bridge:
         bot = bridge.status()
-        bot_text = "متصل عبر Webhook" if bot["connected"] else f"غير متصل: {bot['error'] or 'في انتظار البدء'}"
+        transport = "Polling" if bot.get("mode") == "polling" else "Webhook"
+        bot_text = f"متصل عبر {transport}" if bot["connected"] else f"غير متصل: {bot['error'] or 'في انتظار البدء'}"
     else:
-        bot_text = bridge_error or "غير مُعدّ: أضف TELEGRAM_BOT_TOKEN وTELEGRAM_WEBHOOK_SECRET"
+        bot_text = bridge_error or "غير مُعدّ: أضف TELEGRAM_BOT_TOKEN"
     progress = f"{asset['done']}/{asset['total']}" if asset["total"] else "—"
     return "\n\n".join([
         f"**المحرك العصبي:** {zero_gpu.status()}",
@@ -288,7 +289,7 @@ def build_ui() -> gr.Blocks:
                 status_button = gr.Button("تحديث الحالة")
                 gr.Markdown("""<div class="english-note"><b>كيف يعمل؟</b><br>
                 ① Tesseract بعدة معالجات: تصويت PSM 7/6/13/11 وتصحيح قاموسي.<br>
-                ② البحث أولاً في WhatTheFont ثم WhatFontIs، ثم مكتبة المالك تلقائياً عند غياب تطابق قوي.<br>
+                ② البحث في WhatTheFont ثم WhatFontIs عند ضبط مفاتيحها؛ زر «خاطئة» في البوت يبحث في مكتبة المالك فقط.<br>
                 ③ رسم النص ومقارنة القناع والحواف والنسبة والسُمك والبروفايل عبر Google + مكتبة المالك.<br>
                 ④ DINOv2 يعيد ترتيب أفضل 30؛ على Space يستخدم ZeroGPU، ومحلياً CPU ONNX.<br><br>
                 <b>مهم:</b> اربط Storage Bucket/Volume بمسار البيانات لكي تبقى الخطوط بعد إعادة التشغيل. وجود مجلد قابل للكتابة وحده لا يضمن الحفظ.</div>""")
@@ -320,15 +321,15 @@ def make_lifespan(inner=None):
             mount_telegram(active_app, bridge)
             active_app.add_api_route("/health", health, methods=["GET"])
             active_app.state.englishawy_routes_mounted = True
-        logger.info("Englishawy startup: preparing assets and Telegram webhook")
+        logger.info("Englishawy startup: preparing assets and Telegram transport")
         assets_runtime.start()
         if bridge and not bridge.started:
             try:
                 await bridge.start()
-                logger.info("Telegram webhook registered: %s%s", bridge.base_url, "/telegram/webhook")
+                logger.info("Telegram %s started", bridge.mode)
             except Exception as exc:
                 bridge.error = describe_telegram_error(exc)
-                logger.error("Telegram webhook startup failed: %s", bridge.error)
+                logger.error("Telegram startup failed: %s", bridge.error)
         elif not bridge:
             logger.warning("Telegram remains disabled: %s", bridge_error or "TELEGRAM_BOT_TOKEN is not set")
         async with AsyncExitStack() as stack:

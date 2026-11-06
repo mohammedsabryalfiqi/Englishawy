@@ -22,15 +22,17 @@ import logging
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, BotCommandScopeAllChatAdministrators, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from config import FONT_SUFFIXES, is_owner, owner_telegram_id, storage_status
-from external_font_search import WHATTHEFONT_URL, WHATFONTIS_URL
+import assets_runtime
+from config import FONT_SUFFIXES, admin_telegram_ids, is_admin, is_owner, owner_telegram_id, reply_delay_seconds, storage_status, whatfontis_api_key
 from font_store import format_import_report
 from github_ingestor import parse_github_url
 from pipeline import Identification, identify
@@ -50,13 +52,6 @@ IMAGE_LIMIT = 10 * 1024 * 1024
 
 GITHUB_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+(?:/[^\s]*)?", re.I)
 
-STAGE_AR = {
-    "whatthefont": "MyFonts WhatTheFont (الخيار الأول)",
-    "whatfontis": "WhatFontIs (الخيار الثاني)",
-    "owner_library": "مكتبة المالك (Fallback)",
-}
-
-
 def _services(context) -> Services:
     return context.bot_data["services"]
 
@@ -72,13 +67,18 @@ def _owner(update: Update) -> bool:
     return bool(chat and user and is_owner(user.id, chat.id, chat.type))
 
 
-def _keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌓 عكس الخلفية", callback_data="reanalyze:invert"),
-         InlineKeyboardButton("🔲 عزل ثنائي حاد", callback_data="reanalyze:binarize")],
-        [InlineKeyboardButton("✏️ تصحيح النص يدوياً", callback_data="correct:text"),
-         InlineKeyboardButton("🔄 إعادة تلقائية", callback_data="reanalyze:auto")],
-    ])
+def _admin(update: Update) -> bool:
+    chat, user = update.effective_chat, update.effective_user
+    return bool(chat and user and is_admin(user.id, chat.id, chat.type))
+
+
+def _keyboard(token: str) -> InlineKeyboardMarkup:
+    # Bot API 9.4+ supports real button colors. Keep the emoji as a fallback
+    # for older Telegram clients that ignore `style`.
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ صحيحة", callback_data=f"vote:{token}:correct", style="success"),
+        InlineKeyboardButton("❌ خاطئة", callback_data=f"vote:{token}:wrong", style="danger"),
+    ]])
 
 
 def _source_label(match) -> str:
@@ -93,49 +93,45 @@ def _source_label(match) -> str:
 
 
 def _caption(result: Identification) -> str:
-    stage = STAGE_AR.get(getattr(result, "winning_stage", "owner_library"), "مكتبة المالك")
-    lines = ["🎯 أقرب الخطوط — Englishawy v5",
-             f"📝 النص: {result.text} · ثقة OCR: {result.ocr.confidence:.0f}%",
-             f"🏆 المصدر الفائز: {stage}",
-             f"🗂️ {result.font_count} خط · {result.neural_backend} · {result.elapsed_s:.0f}s", ""]
-    for index, match in enumerate(result.matches, 1):
-        lines.append(f"{index}. {match.family} — {_source_label(match)}")
-    lines += ["", "1️⃣ WhatTheFont أولاً → 2️⃣ WhatFontIs → 3️⃣ مكتبة المالك عند الحاجة.",
-              "معاينة حيّة لكل خط — بدون روابط تحميل."]
-    return "\n".join(lines)[:1024]
+    if not result.matches:
+        return "لم أجد خطاً مطابقاً."
+    best = result.matches[0]
+    caption = f"🎯 {best.family}\n📌 {_source_label(best)}"
+    if result.fallback_used and result.notices:
+        caption += f"\n⚠️ {result.notices[0]}"
+    return caption[:1024]
 
 
-async def _identify_async(services: Services, image: bytes, mode: str, text: str | None) -> Identification:
+async def _identify_async(services: Services, image: bytes, mode: str, text: str | None,
+                          owner_only: bool = False) -> Identification:
+    fonts = await asyncio.to_thread(services.catalog.fonts, "owner" if owner_only else "all")
     async with services.analysis_semaphore:
         return await asyncio.to_thread(identify, image, top_n=MAX_RESULTS, candidates=CANDIDATES,
                                        force_invert=mode == "invert", force_binarize=mode == "binarize",
                                        text_override=text, font_limit=FONT_LIMIT,
-                                       fonts=services.catalog.fonts())
+                                       fonts=fonts, external_first=not owner_only)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = ("أهلاً بيك في Englishawy v5 👋\n\n"
-            "ابعت صورة فيها كلمة إنجليزية، وهبحث بالترتيب:\n"
-            f"1️⃣ WhatTheFont: {WHATTHEFONT_URL}\n"
-            f"2️⃣ WhatFontIs: {WHATFONTIS_URL}\n"
-            "3️⃣ لو ما لقتش الخط المطابق فيهم، أبحث تلقائياً في مكتبة المالك (Tesseract + مطابقة شكل + DINOv2).\n\n"
-            "هتستلم بطاقة مقارنة بالاسم والمعاينة فقط — بدون روابط تحميل.\n"
-            "لو القراءة غلط، ابعت الصورة ومعاها النص الصحيح أو استخدم زر التصحيح.\n"
-            "الأوامر: /help /status")
+    text = ("👋 ابعت صورة كلمة إنجليزية وهرجّعلك أقرب الخطوط بالمعاينة.\n"
+            "✅ صحيحة لتأكيد النتيجة · ❌ خاطئة للبحث في مكتبة المالك فقط.")
     if _owner(update):
-        text += ("\n\n🔐 أوامر المالك: /login /owner /fonts /removefont /import_github /jobs\n"
-                 "📦 ابعت ZIP أو ملفات خطوط هنا لإضافتها للمكتبة. حدّ تنزيل Bot API العادي 20MB؛\n"
-                 "🚀 للمستودعات الضخمة ابعت رابط GitHub (أو /import_github <رابط>) — البوت يحمّله ويثبّته "
-                 "ويحلّله بنفسه في الخلفية حتى لو خرجت من المحادثة.\n"
-                 "للأرشيفات الكبيرة يدوياً: /login ثم تبويب المالك في Gradio.")
+        text += "\n\n🔐 الإدارة: /login /owner /fonts /removefont /import_github /jobs"
+    elif _admin(update):
+        text += "\n\n🛠️ أوامر المدير: /help /status"
     await update.message.reply_text(text)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = _services(context).catalog.stats()
+    if not _admin(update):
+        await update.message.reply_text("🔐 الحالة متاحة للمالك والمديرين في محادثة خاصة.")
+        return
+    stats = await asyncio.to_thread(_services(context).catalog.stats)
     await update.message.reply_text(
-        f"🔎 الترتيب: WhatTheFont ← WhatFontIs ← مكتبة المالك\n"
+        f"🔎 WhatTheFont ← WhatFontIs ← مكتبة المالك\n"
+        f"WhatFontIs: {'مفتاح مضبوط' if whatfontis_api_key() else 'المفتاح غير مضبوط'}\n"
         f"Google: {stats['google']} خط\nمكتبة المالك: {stats['owner']['faces']} وجه / {stats['owner']['families']} عائلة\n"
+        f"⏱️ وقت الرد المضبوط: {reply_delay_seconds():.0f} ثانية على الأقل\n"
         f"{storage_status()['label']}")
 
 
@@ -241,24 +237,58 @@ async def _start_github_from_text(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def _analyze_and_respond(update: Update, context: ContextTypes.DEFAULT_TYPE, status,
-                               image: bytes, mode: str, text: str | None):
-    await status.edit_text("🔬 WhatTheFont ← WhatFontIs ← مكتبة المالك → DINOv2 ⏳")
+                               image: bytes, mode: str, text: str | None, token: str,
+                               owner_only: bool = False, started: float | None = None):
+    services = _services(context)
+    key = _key(update)
+    if key is None or not services.sessions.begin(key, token):
+        await status.edit_text("⏳ فيه تحليل شغال لنفس الصورة؛ استنى النتيجة.")
+        return
+    started = time.monotonic() if started is None else started
+    delay = reply_delay_seconds()
+    task = asyncio.create_task(_identify_async(services, image, mode, text, owner_only))
+    result = None
     try:
-        result = await _identify_async(_services(context), image, mode, text)
+        await status.edit_text("🔎 بفحص الصورة ومراجعة الخطوط..." if not owner_only else "📚 بفحص مكتبة المالك فقط...")
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=4)
+            if not done:
+                try:
+                    await status.edit_text("🔎 لسه بفحص أشكال الحروف وأجهّز المعاينة...")
+                except TelegramError:
+                    pass
+        result = task.result()
+        # This is an explicit owner-requested minimum response time. Time spent
+        # searching/rendering counts toward it; never add 20s on top of real work.
+        remaining = delay - (time.monotonic() - started)
+        while remaining > 0:
+            try:
+                await status.edit_text("🔎 مراجعة أخيرة للنتيجة والمعاينة...")
+            except TelegramError:
+                pass
+            await asyncio.sleep(min(4, remaining))
+            remaining = delay - (time.monotonic() - started)
     except Exception as exc:
         logger.error("Identification failed: %s", type(exc).__name__)
-        await status.edit_text("⚠️ تعذر التحليل. تأكد من تجهيز المكتبة/النماذج أو جرّب صورة أوضح.")
+        await status.edit_text("⚠️ تعذر التحليل. جرّب صورة أوضح أو تأكد من تجهيز المكتبة.")
         return
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        services.sessions.finish(key, token, result.text if result else (text or ""), owner_only)
     if not result.text or not result.matches:
-        await status.edit_text("⚠️ لم أجد نصاً/مرشحين واضحين. جرّب التصحيح اليدوي أو قصّ الكلمة.", reply_markup=_keyboard())
+        message = ("📚 مكتبة المالك فارغة أو مافيها نتيجة مطابقة. ابعت صورة أوضح." if owner_only
+                   else "⚠️ لم أجد نصاً/خطاً واضحاً. جرّب قصّ الكلمة بصورة أوضح.")
+        await status.edit_text(message)
         return
-    try:
-        await status.delete()
-    except Exception:
-        pass
     chat = update.effective_chat
     await chat.send_action(ChatAction.UPLOAD_PHOTO)
-    await chat.send_photo(photo=io.BytesIO(result.card_png), caption=_caption(result), reply_markup=_keyboard())
+    await chat.send_photo(photo=io.BytesIO(result.card_png), caption=_caption(result), reply_markup=_keyboard(token))
+    try:
+        await status.delete()
+    except TelegramError:
+        pass
 
 
 async def _receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, file_size: int | None):
@@ -279,10 +309,11 @@ async def _receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_
     if len(image) > IMAGE_LIMIT:
         await update.message.reply_text("الصورة أكبر من الحد المخصص للتحليل؛ ابعت قصّاً للكلمة.")
         return
-    _services(context).sessions.put(key, image)
+    started = time.monotonic()
+    token = _services(context).sessions.put(key, image)
     override = (update.message.caption or "").strip() or None
-    status = await update.message.reply_text("🔬 استلمت الصورة، جاري البحث بالترتيب...")
-    await _analyze_and_respond(update, context, status, image, "auto", override)
+    status = await update.message.reply_text("🔎 استلمت الصورة، جاري الفحص والمراجعة...")
+    await _analyze_and_respond(update, context, status, image, "auto", override, token, started=started)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,48 +368,101 @@ async def login_hint(update: Update):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key = _key(update)
-    services = _services(context)
     incoming = (update.message.text or "").strip()
-    # Owner pastes a GitHub repo link directly (no command needed)
+    # Owner pastes a GitHub repo link directly (no command needed).
     m = GITHUB_URL_RE.search(incoming)
     if m and _owner(update):
         handled = await _start_github_from_text(update, context, m.group(0))
         if handled:
             return
-    if key and services.sessions.is_awaiting(key):
-        services.sessions.awaiting(key, False)
-        word = incoming[:160]
-        status = await update.message.reply_text(f"🔬 إعادة المطابقة بالنص: {word}")
-        await _analyze_and_respond(update, context, status, services.sessions.get(key), "auto", word)
-    else:
-        await update.message.reply_text("ابعت 📸 صورة فيها كلمة إنجليزية، وهرد باسم الخط ومعاينته فقط.\n(البحث: WhatTheFont ← WhatFontIs ← مكتبة المالك)")
+    await update.message.reply_text(
+        "ابعت 📸 صورة فيها كلمة إنجليزية، وهرد باسم الخط ومعاينته فقط.\n"
+        "لو عايز تصحح النص، ابعت الصورة ومعاها الكابتشن الصحيح.\n"
+        "(البحث: WhatTheFont ← WhatFontIs ← مكتبة المالك)")
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     key = _key(update)
-    image = _services(context).sessions.get(key) if key else None
-    if not query or not query.message or image is None:
+    data = query.data or "" if query else ""
+    parts = data.split(":")
+    state = _services(context).sessions.state(key, parts[1]) if key and len(parts) == 3 and parts[0] == "vote" else None
+    if not query or not query.message or state is None:
         if query:
             await query.answer("انتهت جلسة الصورة؛ ابعتها تاني.", show_alert=True)
         return
-    data = query.data or ""
-    if data == "correct:text":
-        _services(context).sessions.awaiting(key, True)
+    if parts[2] == "correct":
+        await query.answer("✅ تم تأكيد النتيجة.")
+        return
+    if parts[2] != "wrong":
         await query.answer()
-        await query.message.reply_text("✏️ اكتب النص الصحيح كما يظهر في الصورة، وهعيد المطابقة.")
-    elif data in {"reanalyze:invert", "reanalyze:binarize", "reanalyze:auto"}:
-        await query.answer("جاري إعادة التحليل...")
-        status = await query.message.reply_text("🔄 إعادة التحليل...")
-        await _analyze_and_respond(update, context, status, image, data.split(":", 1)[1], None)
-    else:
-        await query.answer()
+        return
+    if state.owner_only:
+        await query.answer("دي بالفعل نتائج مكتبة المالك. جرّب صورة أوضح أو أضف خطوطاً للمكتبة.", show_alert=True)
+        return
+    if state.busy:
+        await query.answer("⏳ استنى نتيجة التحليل الحالي.")
+        return
+    await query.answer("📚 هبحث في مكتبة المالك فقط.")
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+    status = await query.message.reply_text("📚 تركت نتائج المواقع؛ جاري فحص مكتبة المالك...")
+    # Reuse the OCR text from the rejected card, without calling either website.
+    await _analyze_and_respond(update, context, status, state.image, "auto", state.text or None,
+                               state.token, owner_only=True)
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     # PTB HTTP exceptions can embed the bot-token URL; do not log their full text.
-    logger.error("Telegram handler error: %s", type(context.error).__name__)
+    name = type(context.error).__name__
+    if name == "Conflict":
+        logger.error("Telegram Conflict: another process is polling with this token; stop the duplicate bot")
+    else:
+        logger.error("Telegram handler error: %s", name)
+
+
+PUBLIC_COMMANDS: list[tuple[str, str]] = []
+ADMIN_COMMANDS = [("start", "بدء استخدام البوت"), ("help", "طريقة الاستخدام"), ("status", "حالة المكتبة والبحث")]
+OWNER_COMMANDS = ADMIN_COMMANDS + [
+    ("login", "كود دخول لوحة المالك"), ("owner", "حالة مكتبة المالك"),
+    ("fonts", "عرض الخطوط"), ("removefont", "حذف خط بالرقم"),
+    ("import_github", "استيراد مستودع خطوط"), ("jobs", "متابعة الاستيراد"),
+]
+
+
+async def configure_command_menus(bot) -> None:
+    """Hide the menu from everyone except the owner and explicit bot admins.
+
+    Menus are visibility, not authorization: every management handler still
+    checks the authenticated Telegram sender and private chat independently.
+    """
+    for scope in (BotCommandScopeDefault(), BotCommandScopeAllPrivateChats(),
+                  BotCommandScopeAllGroupChats(), BotCommandScopeAllChatAdministrators()):
+        await bot.set_my_commands(PUBLIC_COMMANDS, scope=scope)
+    # Per-chat menus are best-effort: an admin who has never opened the bot can
+    # make Telegram reject that chat scope, and must not take polling down.
+    try:
+        await bot.set_my_commands([BotCommand(*item) for item in OWNER_COMMANDS],
+                                  scope=BotCommandScopeChat(chat_id=owner_telegram_id()))
+    except TelegramError:
+        logger.warning("Owner command menu could not be set; owner should open/start the bot once")
+    for admin_id in sorted(admin_telegram_ids()):
+        try:
+            await bot.set_my_commands([BotCommand(*item) for item in ADMIN_COMMANDS],
+                                      scope=BotCommandScopeChat(chat_id=admin_id))
+        except TelegramError:
+            logger.warning("Admin command menu could not be set for %s", admin_id)
+
+
+async def post_init(application: Application) -> None:
+    try:
+        await configure_command_menus(application.bot)
+    except TelegramError:
+        # Menu visibility is cosmetic; handler authorization is not. A transient
+        # Telegram API failure here must not prevent polling from answering users.
+        logger.warning("Telegram command menus could not be fully configured; authorization remains enforced")
 
 
 def register_handlers(application: Application, services: Services) -> None:
@@ -399,13 +483,19 @@ def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env or the environment")
-    builder = Application.builder().token(token).concurrent_updates(4)
+    builder = (Application.builder().token(token).concurrent_updates(4)
+               .post_init(post_init).connect_timeout(15).read_timeout(30)
+               .write_timeout(30).pool_timeout(15).get_updates_read_timeout(35))
     if os.getenv("TELEGRAM_LOCAL_API", "0").lower() in {"1", "true", "yes"}:
         builder = builder.base_url(os.getenv("TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081/bot")).local_mode(True)
     application = builder.build()
     register_handlers(application, Services.create())
-    logger.info("Englishawy v5 polling bot started; owner=%s", owner_telegram_id())
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    assets_runtime.start()
+    logger.info("Englishawy polling starting; owner=%s", owner_telegram_id())
+    # run_polling removes an old webhook before getUpdates. Keep queued photos
+    # (drop_pending_updates=False), retry bootstrap, and allow slow mobile links.
+    application.run_polling(allowed_updates=["message", "callback_query"],
+                            drop_pending_updates=False, timeout=30, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
