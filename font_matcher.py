@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -48,6 +48,8 @@ class FontMatch:
     source: str = "google"
     face_index: int = 0
     style: str = "Regular"
+    preview_image: Image.Image | None = field(default=None, repr=False)
+    source_url: str = ""
 
 
 @lru_cache(maxsize=1)

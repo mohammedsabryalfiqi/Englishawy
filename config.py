@@ -10,7 +10,9 @@ New in v5:
 """
 from __future__ import annotations
 
+import math
 import os
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -42,6 +44,39 @@ def is_owner(user_id: int | None, chat_id: int | None = None, chat_type: str | N
     )
 
 
+def admin_telegram_ids() -> set[int]:
+    """Explicit bot administrators; malformed overrides fail closed.
+
+    The owner is always an administrator. Group membership or a claimed role is
+    never used to grant access to bot-management commands.
+    """
+    raw = os.getenv("ADMIN_TELEGRAM_IDS", "").strip()
+    if not raw:
+        return set()
+    values = re.split(r"[,;\s]+", raw)
+    if any(not re.fullmatch(r"[1-9]\d*", value) for value in values):
+        raise ValueError("ADMIN_TELEGRAM_IDS must contain positive integer Telegram IDs")
+    return {int(value) for value in values} - {owner_telegram_id()}
+
+
+def is_admin(user_id: int | None, chat_id: int | None = None, chat_type: str | None = None) -> bool:
+    return (is_owner(user_id, chat_id, chat_type)
+            or (isinstance(user_id, int) and user_id in admin_telegram_ids()
+                and (chat_id is None or chat_id == user_id)
+                and (chat_type is None or chat_type == "private")))
+
+
+def reply_delay_seconds() -> float:
+    """Minimum receipt-to-result time, not a claim of extra model computation."""
+    try:
+        value = float(os.getenv("BOT_REPLY_DELAY_SECONDS", "20"))
+    except ValueError:
+        return 20.0
+    if not math.isfinite(value):
+        return 20.0
+    return max(0.0, min(120.0, value))
+
+
 def cascade_threshold() -> float:
     """External-match acceptance threshold (default 0.78)."""
     try:
@@ -52,7 +87,9 @@ def cascade_threshold() -> float:
 
 
 def whatfontis_api_key() -> str:
-    return os.getenv("WHATFONTIS_API_KEY", "").strip()
+    # Accept the common token spelling without ever displaying the credential.
+    return (os.getenv("WHATFONTIS_API_KEY", "").strip()
+            or os.getenv("WHATFONTIS_TOKEN", "").strip())
 
 
 def myfonts_api_key() -> str:

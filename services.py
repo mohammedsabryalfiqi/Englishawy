@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,40 +21,69 @@ from github_ingestor import GithubRepoIngestor
 from owner_auth import OwnerAuth
 
 
+@dataclass
+class ImageSession:
+    image: bytes
+    expires: float
+    token: str
+    text: str = ""
+    owner_only: bool = False
+    busy: bool = False
+
+
 class ImageSessions:
+    """Bounded, thread-safe image state; callback tokens reject stale cards."""
+
     def __init__(self, capacity: int = 32, ttl: int = 1800):
         self.capacity, self.ttl = capacity, ttl
-        self._items: OrderedDict[tuple[int, int], tuple[bytes, float, bool]] = OrderedDict()
+        self._items: OrderedDict[tuple[int, int], ImageSession] = OrderedDict()
         self._lock = threading.RLock()
 
-    def put(self, key: tuple[int, int], image: bytes) -> None:
+    def _live(self, key: tuple[int, int]) -> ImageSession | None:
+        item = self._items.get(key)
+        if item is not None and item.expires <= time.monotonic():
+            del self._items[key]
+            return None
+        return item
+
+    def put(self, key: tuple[int, int], image: bytes) -> str:
         with self._lock:
-            now = time.monotonic()
-            self._items[key] = (image, now + self.ttl, False)
+            token = uuid.uuid4().hex[:12]
+            self._items[key] = ImageSession(image, time.monotonic() + self.ttl, token)
             self._items.move_to_end(key)
             while len(self._items) > self.capacity:
                 self._items.popitem(last=False)
+            return token
 
     def get(self, key: tuple[int, int]) -> bytes | None:
         with self._lock:
-            item = self._items.get(key)
-            if not item:
-                return None
-            if item[1] <= time.monotonic():
-                del self._items[key]
-                return None
-            return item[0]
+            item = self._live(key)
+            return item.image if item else None
 
-    def awaiting(self, key: tuple[int, int], value: bool) -> None:
+    def current(self, key: tuple[int, int]) -> ImageSession | None:
         with self._lock:
-            item = self.get(key)
+            return self._live(key)
+
+    def state(self, key: tuple[int, int], token: str) -> ImageSession | None:
+        with self._lock:
+            item = self._live(key)
+            return item if item is not None and item.token == token else None
+
+    def begin(self, key: tuple[int, int], token: str) -> bool:
+        with self._lock:
+            item = self.state(key, token)
+            if item is None or item.busy:
+                return False
+            item.busy = True
+            return True
+
+    def finish(self, key: tuple[int, int], token: str, text: str = "", owner_only: bool = False) -> None:
+        with self._lock:
+            item = self.state(key, token)
             if item is not None:
-                self._items[key] = (item, self._items[key][1], value)
-
-    def is_awaiting(self, key: tuple[int, int]) -> bool:
-        with self._lock:
-            return self.get(key) is not None and self._items[key][2]
-
+                item.busy = False
+                item.text = text or item.text
+                item.owner_only = owner_only
 
 @dataclass
 class Services:

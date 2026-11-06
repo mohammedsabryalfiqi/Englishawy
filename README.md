@@ -14,7 +14,7 @@ preload_from_hub:
   - facebook/dinov2-small
 ---
 
-# Englishawy v4 — Gradio / Hugging Face ZeroGPU
+# Englishawy — Gradio / Hugging Face ZeroGPU
 
 كاشف خطوط إنجليزي بواجهة عربية، وبوت تليجرام، ومكتبة خطوط خاصة بالمالك تُستخدم في البحث إلى جانب Google Fonts.
 
@@ -43,7 +43,10 @@ preload_from_hub:
 | النوع | الاسم | القيمة/الوظيفة |
 |---|---|---|
 | Secret | `TELEGRAM_BOT_TOKEN` | توكن BotFather |
-| Secret | `TELEGRAM_WEBHOOK_SECRET` | نص عشوائي 16 حرفاً على الأقل، مثلاً `openssl rand -hex 32` |
+| Variable | `TELEGRAM_MODE` | `polling` (الافتراضي) |
+| Secret | `WHATFONTIS_API_KEY` | مفتاح WhatFontIs الرسمي |
+| Variable | `ADMIN_TELEGRAM_IDS` | أرقام المديرين مفصولة بفواصل، اختياري |
+| Variable | `BOT_REPLY_DELAY_SECONDS` | `20` |
 | Variable | `OWNER_TELEGRAM_ID` | `5231453921` (وهو الافتراضي في الكود) |
 | Variable | `ENGLISHAWY_DATA` | `/data/englishawy` |
 | Variable | `ENGLISHAWY_PERSISTENT_STORAGE` | `1` **بعد** ربط Volume فعلياً |
@@ -51,9 +54,9 @@ preload_from_hub:
 
 5. اربط **Storage Bucket كـVolume** على `/data` بوضع قراءة/كتابة. التخزين العادي في Space مؤقت؛ مجرد وجود `/data` لا يثبت أنه دائم. التطبيق يعرض تحذيراً إذا لم تؤكد ربط التخزين الدائم.
 6. شغّل/أعد تشغيل Space. يجهّز Tesseract وخطوط Google ونموذج ONNX الاحتياطي في الخلفية، ويظهر التقدم في تبويب الحالة. يُجهّز النموذج العصبي من HF أثناء البناء ويُحمّل إلى CUDA على مستوى الوحدة (module scope) حسب إرشادات ZeroGPU.
-7. يفتح التطبيق Webhook على نفس منفذ Gradio: `https://SPACE_HOST/telegram/webhook`. `SPACE_HOST` توفره HF تلقائياً. عند استخدام نطاق مخصص اضبط `PUBLIC_BASE_URL` كـHTTPS.
+7. الوضع الافتراضي `TELEGRAM_MODE=polling`: يبدأ البوت داخل عملية Gradio نفسها ويحذف Webhook القديم تلقائياً. لا يحتاج رابطاً عاماً أو سر Webhook. وضع Webhook اختياري فقط عند ضبط `TELEGRAM_MODE=webhook` صراحةً مع `PUBLIC_BASE_URL` و`TELEGRAM_WEBHOOK_SECRET`.
 
-> لا تشغّل `bot.py` polling بنفس التوكن أثناء تشغيل Webhook على Space؛ سيحدث تعارض في استلام التحديثات.
+> شغّل مستهلكاً واحداً فقط لكل توكن: `app.py` على Space أو `bot.py` محلياً. تشغيل نسختين معاً يسبب `Conflict`.
 
 ### ZeroGPU
 
@@ -68,17 +71,18 @@ preload_from_hub:
 اللوج الطبيعي بعد الإصلاح يجب أن يحتوي على:
 
 ```text
-Englishawy startup: preparing assets and Telegram webhook
-Telegram webhook registered: https://YOUR-SPACE.hf.space/telegram/webhook
+Englishawy startup: preparing assets and Telegram transport
+Telegram polling started
 ```
 
 - إذا ظهر `Telegram bot disabled: TELEGRAM_BOT_TOKEN is not set` أضف التوكن في **Settings → Variables and secrets → Secrets** وليس في ملف `.env` داخل المستودع.
-- إذا ظهر خطأ `TELEGRAM_WEBHOOK_SECRET` أضف سراً عشوائياً 16 حرفاً على الأقل، ثم أعد تشغيل Space.
+- في وضع polling لا تحتاج `TELEGRAM_WEBHOOK_SECRET`. إذا اخترت `TELEGRAM_MODE=webhook` صراحةً، أضف سراً عشوائياً 16 حرفاً على الأقل ورابط HTTPS عاماً.
+- إذا ظهر `Conflict` أوقف أي نسخة أخرى تستخدم نفس التوكن (مثلاً `bot.py` محلياً أثناء تشغيل Space).
 - إذا ظهر `InvalidToken` راجع توكن BotFather.
-- افحص `https://YOUR-SPACE.hf.space/health`؛ يجب أن يظهر `telegram.configured=true` و`connected=true` بعد نجاح التسجيل.
-- لا تشغّل `python bot.py` بنفس التوكن على جهازك أثناء تشغيل Webhook على Space.
+- افحص `/health`؛ يجب أن يظهر `telegram.configured=true` و`connected=true` و`mode=polling` بعد البدء.
+- لا تشغّل `python bot.py` بنفس التوكن على جهازك أثناء تشغيل البوت داخل Space.
 
-> كان الخلل السابق أن Gradio ينشئ تطبيق FastAPI جديداً داخل `launch()`، فتضيع المسارات المسجلة على `demo.app` قبل الإطلاق. الإصلاح يمرّر lifespan إلى التطبيق الفعلي الذي يخدم الطلبات.
+> دليل الإعدادات والأزرار والمعاينات والمديرين: راجع `README_V5_FULL_AR.md`.
 
 ## مكتبة المالك
 
@@ -138,7 +142,7 @@ python identify_cli.py image.png --text "Question" --source all --out card.png
 python -m pytest -q
 ```
 
-تغطي: هوية المالك، الكود أحادي الاستخدام وانتهاء الجلسة، فك ZIP الآمن، archive >200MiB بلا حدّ تطبيقي، الخطوط التالفة/المتداخلة، WOFF، الحفظ وإعادة الفتح والحذف، بحث خطوط المالك، Webhook secret، ورفض رفع غير المالك قبل التنزيل، بطاقة المقارنة، وواجهة ZeroGPU بدرجات CPU باستخدام نموذج mock.
+تغطي: هوية المالك، الكود أحادي الاستخدام وانتهاء الجلسة، فك ZIP الآمن، archive >200MiB بلا حدّ تطبيقي، الخطوط التالفة/المتداخلة، WOFF، الحفظ وإعادة الفتح والحذف، بحث خطوط المالك، الأزرار وقائمة المديرين وpolling/Webhook، المعاينة النصية، ورفض رفع غير المالك قبل التنزيل، بطاقة المقارنة، وواجهة ZeroGPU بدرجات CPU باستخدام نموذج mock.
 
 **لم يتم اختبار عتاد ZeroGPU الفعلي أو نشر Space حي من هذه البيئة.** المسار المحلي CPU والاختبارات الآلية منفذة؛ تحقق من Space بعد النشر لأن الحصة/الشبكة/التخزين تعتمد على حسابك وإعداداته.
 
@@ -146,12 +150,13 @@ python -m pytest -q
 
 | الملف | الدور |
 |---|---|
-| `app.py` | Gradio UI + FastAPI health/webhook على منفذ واحد |
+| `app.py` | Gradio UI + Telegram polling افتراضياً + health على منفذ واحد |
 | `zero_gpu.py` | تهيئة DINOv2 على مستوى module وحد GPU ضيق |
 | `neural_reranker.py` | تجهيز مدخلات CPU ومزج الدرجات واحتياطي ONNX |
 | `font_store.py` / `font_analysis.py` | فك/فحص/تثبيت وفهرسة خطوط المالك |
 | `owner_auth.py` | أكواد تليجرام لمرة واحدة وجلسات متصفح مبهمة |
-| `bot.py` / `telegram_webhook.py` | أوامر تليجرام، polling محلي أو webhook على Space |
+| `bot.py` / `telegram_webhook.py` | أوامر تليجرام، polling افتراضي أو webhook اختياري |
+| `font_preview.py` | معاينة الكلمة نفسها من WhatFontIs مع تحقق وكاش |
 | `font_catalog.py` | Google + owner كمصدر بحث واحد |
 | `preprocessor.py` / `ocr_engine.py` | Tesseract voting/dictionary |
 | `font_matcher.py` | shape/stroke/aspect matching |

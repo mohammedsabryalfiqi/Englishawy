@@ -7,7 +7,10 @@ heavy local shape matching. Drop-in replacement for the original pipeline.py.
 """
 from __future__ import annotations
 
+import io
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -15,8 +18,10 @@ import numpy as np
 
 import neural_reranker
 from comparison_card import render_card
-from external_font_search import CASCADE_THRESHOLD, search_external_first
+from config import cascade_threshold
+from external_font_search import search_external_first
 from font_matcher import FontMatch, match_fonts, render_text
+from font_preview import whatfontis_preview
 from ocr_engine import OCRResult, read_text
 from preprocessor import PreprocessResult, preprocess
 
@@ -35,21 +40,44 @@ class Identification:
     neural_backend: str = "shape-only"
     winning_stage: str = "owner_library"  # whatthefont | whatfontis | owner_library
     fallback_used: bool = True
+    preview_count: int = 0
+    notices: list[str] = field(default_factory=list)
 
 
-def _local_path_for(family: str, fonts: list[dict] | None) -> tuple[str, int, str]:
-    """If an external family already exists locally, reuse its file so the
-    comparison card can render a REAL preview instead of 'Preview unavailable'."""
+def _name_key(value: str) -> str:
+    value = re.sub(r"\.(ttf|otf|woff2?)\b", " ", value, flags=re.I)
+    value = re.sub(r"\b(regular|normal|otf|ttf|400)\b", " ", value, flags=re.I)
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _local_path_for(family: str, fonts: list[dict] | None, style: str = "Regular") -> tuple[str, int, str]:
+    """Reuse only an exact family/style match, never a misleading substring.
+
+    For example, 'Nexa Rust Script L 0' must not render in 'Nexa Script' or a
+    different shadow/trial face merely because the names overlap.
+    """
     if not fonts:
         return "", 0, "sans-serif"
-    want = (family or "").strip().lower()
+    family_key = _name_key(family)
+    full_key = _name_key(f"{family} {style}")
+    # Prefer an exact full face name. A Bold/Italic request must never silently
+    # render in the family's Regular face just because the family name matches.
     for f in fonts:
-        if str(f.get("family", "")).strip().lower() == want:
-            return str(f.get("path", "")), int(f.get("face_index", 0)), str(f.get("category", "sans-serif"))
-    for f in fonts:  # partial fallback: "Gotham" matches "Gotham Pro"
-        fam = str(f.get("family", "")).strip().lower()
-        if want and (want in fam or fam in want):
-            return str(f.get("path", "")), int(f.get("face_index", 0)), str(f.get("category", "sans-serif"))
+        local_family = str(f.get("family", ""))
+        local_style = str(f.get("style", "Regular"))
+        keys = {_name_key(f"{local_family} {local_style}"),
+                _name_key(f"{local_style} {local_family}")} - {""}
+        path = str(f.get("path", ""))
+        if path and full_key and full_key in keys:
+            return path, int(f.get("face_index", 0)), str(f.get("category", "sans-serif"))
+    # Family-only fallback is allowed only for an explicitly Regular/normal face.
+    if family_key and _name_key(style) == "":
+        for f in fonts:
+            local_family = str(f.get("family", ""))
+            local_style = str(f.get("style", "Regular"))
+            path = str(f.get("path", ""))
+            if path and _name_key(local_style) == "" and _name_key(local_family) == family_key:
+                return path, int(f.get("face_index", 0)), str(f.get("category", "sans-serif"))
     return "", 0, "sans-serif"
 
 
@@ -89,26 +117,37 @@ def identify(
     backend_name = "shape-only"
     winning_stage = "owner_library"
     fallback_used = True
+    notices: list[str] = []
 
     # ---- Stage 1+2: external sites FIRST ---------------------------------
     if external_first and ocr.text:
-        cascade = search_external_first(image_bytes, ocr_text=ocr.text, threshold=CASCADE_THRESHOLD)
+        # The API is told this is a tight crop. Send the actual crop, not a full
+        # Telegram screenshot with unrelated UI/background around the word.
+        crop_buffer = io.BytesIO()
+        prep.original_crop.save(crop_buffer, format="PNG")
+        cascade = search_external_first(crop_buffer.getvalue(), ocr_text=ocr.text, threshold=cascade_threshold())
+        notices.extend(cascade.notices)
         timings.update(cascade.timings)
         if not cascade.fallback_to_owner and cascade.matches:
             winning_stage = cascade.winning_stage
             fallback_used = False
-            for ext in cascade.matches[:top_n]:
-                local_path, face, cat = _local_path_for(ext.family, fonts)
+            selected = cascade.matches[:top_n]
+            # Fetch the actual-word renderings concurrently. Each worker has a
+            # bounded deadline; a failed provider preview never blocks the card.
+            with ThreadPoolExecutor(max_workers=min(5, max(1, len(selected)))) as pool:
+                futures = [pool.submit(whatfontis_preview, ext.source_url, ocr.text)
+                           if ext.source == "WhatFontIs" else None for ext in selected]
+                provider_previews = [future.result() if future is not None else None for future in futures]
+            for ext, provider_preview in zip(selected, provider_previews):
+                local_path, face, cat = _local_path_for(ext.family, fonts, ext.style)
                 matches.append(FontMatch(
                     slug=f"ext-{ext.source}-{ext.family}".lower().replace(" ", "-")[:80],
                     family=ext.family, category=cat, font_path=local_path,
                     score=ext.score, iou=ext.score, aspect_diff=0.0,
                     weight_diff=0.0, edge_sim=ext.score,
                     source=f"external:{ext.source}", face_index=face, style=ext.style,
+                    preview_image=provider_preview, source_url=ext.source_url,
                 ))
-            # attach page URL for caption/table via dynamic attr (card ignores it)
-            for m, ext in zip(matches, cascade.matches[:top_n]):
-                m.source_url = ext.source_url  # type: ignore[attr-defined]
 
     # ---- Stage 3: owner/Google library fallback ---------------------------
     if fallback_used and ocr.text:
@@ -135,4 +174,6 @@ def identify(
         font_count=count, elapsed_s=round(time.time() - start, 2),
         neural_used=backend_name != "shape-only", timings=timings, neural_backend=backend_name,
         winning_stage=winning_stage, fallback_used=fallback_used,
+        preview_count=sum(bool(m.font_path) or m.preview_image is not None for m in matches),
+        notices=notices,
     )
