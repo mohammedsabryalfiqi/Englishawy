@@ -1,5 +1,5 @@
 import io
-import urllib.parse
+import time
 
 import pytest
 from PIL import Image, ImageDraw, ImageFont
@@ -10,12 +10,6 @@ from font_matcher import FontMatch
 from pipeline import _local_path_for
 
 
-PAGE = '''<a name="ct"></a><form id="sample"></form>
-<img src="//d1ly52g9wjvbd2.cloudfront.net/images/spacer.gif"
- data-src="https://imgall.whatfontis.com/index.php?p=refresh&amp;id=638817&amp;text=WhatFontis.com"
- id="result638817" class="lazy">'''
-
-
 def word_png(text="welcome baby"):
     image = Image.new("RGB", (520, 100), "white")
     ImageDraw.Draw(image).text((15, 30), text, fill="black")
@@ -24,41 +18,72 @@ def word_png(text="welcome baby"):
     return buffer.getvalue()
 
 
-def test_discovers_real_custom_text_endpoint_and_replaces_text():
-    endpoint = font_preview.custom_preview_endpoint(PAGE, "welcome baby & more")
-    assert endpoint is not None
-    query = urllib.parse.parse_qs(urllib.parse.urlsplit(endpoint).query)
-    assert query == {"p": ["refresh"], "id": ["638817"], "text": ["welcome baby & more"]}
-    assert urllib.parse.urlsplit(endpoint).hostname == "imgall.whatfontis.com"
+def blank_png():
+    buffer = io.BytesIO()
+    Image.new("RGB", (100, 50), "white").save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
-def test_preview_rejects_untrusted_endpoint_and_blank_image():
-    evil = PAGE.replace("imgall.whatfontis.com", "127.0.0.1")
-    assert font_preview.custom_preview_endpoint(evil, "hello") is None
-    assert font_preview._validated_image(io.BytesIO(Image.new("RGB", (100, 50), "white").tobytes()).getvalue()) is None
-    blank = io.BytesIO()
-    Image.new("RGB", (100, 50), "white").save(blank, format="PNG")
-    assert font_preview._validated_image(blank.getvalue()) is None
+def test_validated_image_rejects_blank_and_accepts_ink():
+    assert font_preview._validated_image(b"") is None
+    assert font_preview._validated_image(blank_png()) is None
     assert font_preview._validated_image(word_png()) is not None
 
 
-def test_preview_fetches_word_and_uses_cache(tmp_path, monkeypatch):
+def test_specimen_preview_fetches_first_usable_specimen(tmp_path, monkeypatch):
     monkeypatch.setattr(font_preview, "PREVIEW_DIR", tmp_path)
     calls = []
 
     def fake_get(url, hosts, limit, timeout, accept, deadline):
         calls.append(url)
-        return PAGE.encode() if accept == "text/html" else word_png()
+        return word_png()
 
     monkeypatch.setattr(font_preview, "_get", fake_get)
-    url = "https://www.whatfontis.com/NMY_Example.font"
-    first = font_preview.whatfontis_preview(url, "welcome baby")
-    second = font_preview.whatfontis_preview(url, "welcome baby")
-    assert first is not None and second is not None
-    assert len(calls) == 2
-    assert "text=welcome+baby" in calls[0]
-    assert "text=welcome+baby" in calls[1]
-    assert list(tmp_path.glob("*.png"))
+    url = "https://d1ly52g9wjvbd2.cloudfront.net/img16/A/L/ExampleA.png"
+    image = font_preview.specimen_preview((url,))
+    assert image is not None
+    assert calls == [url]
+    assert len(list(tmp_path.glob("*.png"))) == 1
+
+
+def test_specimen_preview_uses_cache_on_second_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(font_preview, "PREVIEW_DIR", tmp_path)
+    calls = []
+
+    def fake_get(url, hosts, limit, timeout, accept, deadline):
+        calls.append(url)
+        return word_png()
+
+    monkeypatch.setattr(font_preview, "_get", fake_get)
+    url = "https://d1ly52g9wjvbd2.cloudfront.net/img16/A/L/ExampleA.png"
+    assert font_preview.specimen_preview((url,)) is not None
+    assert font_preview.specimen_preview((url,)) is not None
+    assert len(calls) == 1
+
+
+def test_specimen_preview_skips_blank_then_uses_next(tmp_path, monkeypatch):
+    monkeypatch.setattr(font_preview, "PREVIEW_DIR", tmp_path)
+    seen = []
+
+    def fake_get(url, hosts, limit, timeout, accept, deadline):
+        seen.append(url)
+        return blank_png() if url.endswith("blank.png") else word_png()
+
+    monkeypatch.setattr(font_preview, "_get", fake_get)
+    urls = ("https://d1ly52g9wjvbd2.cloudfront.net/blank.png",
+            "https://d1ly52g9wjvbd2.cloudfront.net/ok.png")
+    assert font_preview.specimen_preview(urls) is not None
+    assert seen == list(urls)
+
+
+def test_specimen_preview_rejects_untrusted_hosts(monkeypatch):
+    def fake_get(*args, **kwargs):
+        raise AssertionError("nothing may be fetched from a non-provider host")
+
+    monkeypatch.setattr(font_preview, "_get", fake_get)
+    assert font_preview.specimen_preview(("http://d1ly52g9wjvbd2.cloudfront.net/a.png",)) is None
+    assert font_preview.specimen_preview(("https://127.0.0.1/a.png",)) is None
+    assert font_preview.specimen_preview(()) is None
 
 
 def test_exact_style_lookup_does_not_substitute_different_nexa_face(sample_font):
@@ -87,13 +112,11 @@ def test_provider_word_preview_appears_in_card_without_font_file():
     assert match.preview_image is not None
 
 
-def test_custom_section_is_preferred_and_fragment_is_dropped():
-    earlier = '<img data-src="https://imgall.whatfontis.com/index.php?p=refresh&id=1&text=x">'
-    page = earlier + PAGE
-    endpoint = font_preview.custom_preview_endpoint(page, "hello")
-    assert urllib.parse.parse_qs(urllib.parse.urlsplit(endpoint).query)["id"] == ["638817"]
-    assert font_preview._safe_url("https://www.whatfontis.com/NMY_X.font#ct", font_preview.PAGE_HOSTS) == \
-        "https://www.whatfontis.com/NMY_X.font"
+def test_card_never_names_the_upstream_service():
+    match = FontMatch("ext", "Nexa Script", "script", "", 0.9, 0, 0, 0, 0,
+                      source="external:WhatFontIs")
+    card = render_card(Image.new("RGB", (250, 70), "white"), "welcome baby", [match])
+    assert card.startswith(b"\x89PNG")
 
 
 def test_family_name_truncation_includes_ellipsis_width():
@@ -121,7 +144,7 @@ def test_redirects_cannot_leave_https_allowlist(monkeypatch):
         return Response()
 
     monkeypatch.setattr(font_preview.requests, "get", fake_get)
-    import time
-    assert font_preview._get("https://www.whatfontis.com/test", font_preview.PAGE_HOSTS,
-                             1000, (1, 1), "text/html", time.monotonic() + 5) is None
+    assert font_preview._get("https://d1ly52g9wjvbd2.cloudfront.net/test.png",
+                             font_preview.PREVIEW_HOSTS, 1000, (1, 1), "image/*",
+                             time.monotonic() + 5) is None
     assert len(calls) == 1

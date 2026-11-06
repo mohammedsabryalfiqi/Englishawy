@@ -54,7 +54,8 @@ def result(owner=False):
     Image.new("RGB", (20, 20), "white").save(buffer, format="PNG")
     match = FontMatch("owner:1", "Owner Script", "owner", "", 0.9, 0.8, 0.1, 0.1, 0.8,
                       source="owner" if owner else "external:WhatFontIs")
-    return Identification("welcome baby", SimpleNamespace(confidence=43), SimpleNamespace(),
+    prep = SimpleNamespace(original_crop=Image.new("RGB", (20, 20), "white"))
+    return Identification("welcome baby", SimpleNamespace(confidence=43), prep,
                           [match], buffer.getvalue(), 1, 0.2, False,
                           winning_stage="owner_library" if owner else "whatfontis", fallback_used=owner)
 
@@ -85,9 +86,9 @@ def test_delay_defaults_to_twenty_and_is_bounded(monkeypatch):
     assert reply_delay_seconds() == 20
 
 
-def test_only_two_feedback_buttons_and_short_caption():
+def test_feedback_buttons_and_word_fix_and_short_caption():
     keyboard = bot._keyboard("abc123")
-    assert len(keyboard.inline_keyboard) == 1
+    assert len(keyboard.inline_keyboard) == 3
     buttons = keyboard.inline_keyboard[0]
     assert [button.text for button in buttons] == ["✅ صحيحة", "❌ خاطئة"]
     assert buttons[0].callback_data == "vote:abc123:correct"
@@ -95,9 +96,58 @@ def test_only_two_feedback_buttons_and_short_caption():
     assert buttons[0].style == "success" and buttons[1].style == "danger"
     payload = keyboard.to_dict()["inline_keyboard"][0]
     assert payload[0]["style"] == "success" and payload[1]["style"] == "danger"
+    fix = keyboard.inline_keyboard[1][0]
+    assert fix.callback_data == "fix:abc123"
+    assert "الكلمة" in fix.text
+    file_button = keyboard.inline_keyboard[2][0]
+    assert file_button.callback_data == "file:abc123"
+    assert "الخط" in file_button.text
     caption = bot._caption(result())
-    assert caption == "🎯 Owner Script\n📌 WhatFontIs"
+    assert caption == "🎯 Owner Script\n📌 بحث خارجي"
     assert len(caption.splitlines()) == 2
+
+
+def test_caption_labels_merged_source_and_shows_notices():
+    merged = result()
+    merged.matches[0].source = "merged"
+    merged.notices = ["الثقة في النتيجة منخفضة — راجع المرشحين قبل الاعتماد عليهم."]
+    assert bot._source_label(merged.matches[0]) == "بحث خارجي + مكتبتك"
+    # A merged result is not a fallback, but its notice still has to reach the user.
+    assert "الثقة" in bot._caption(merged)
+
+
+def test_corrected_word_redraws_card_without_new_search(tmp_path, monkeypatch):
+    async def run():
+        services = Services.create(tmp_path)
+        token = services.sessions.put((10, 10), b"image")
+        services.sessions.finish((10, 10), token, "wlecome", False, result=result())
+        chat = Chat()
+        message = Message()
+        message.text = "welcome baby"
+        update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=10),
+                                 effective_chat=chat)
+
+        async def no_search(*args, **kwargs):
+            raise AssertionError("a corrected word must not start a new search")
+
+        calls = []
+
+        def fake_render(crop, text, matches, top_n=5, ocr_confidence=None):
+            calls.append((text, len(matches)))
+            return result().card_png
+
+        monkeypatch.setattr(bot, "_identify_async", no_search)
+        monkeypatch.setattr(bot, "render_card", fake_render)
+        context = SimpleNamespace(bot_data={"services": services}, user_data={"word_fix": {
+            "token": token, "chat_id": 10, "message_id": 5, "until": time.monotonic() + 60}})
+        await bot.handle_text(update, context)
+        assert calls == [("welcome baby", 1)]
+        assert len(chat.photos) == 1
+        assert "welcome baby" in chat.photos[0]["caption"]
+        assert services.sessions.current((10, 10)).text == "welcome baby"
+        assert "word_fix" not in context.user_data
+
+    asyncio.run(run())
 
 
 def test_command_menus_default_empty_and_scoped(monkeypatch):
@@ -150,7 +200,7 @@ def test_wrong_button_uses_owner_library_without_external_search(tmp_path, monke
         context = SimpleNamespace(bot_data={"services": services})
         calls = []
 
-        async def fake_identify(svc, image, mode, text, owner_only=False):
+        async def fake_identify(svc, image, mode, text, owner_only=False, cancel=None):
             calls.append((image, text, owner_only))
             return result(owner=True)
 
@@ -216,5 +266,106 @@ def test_minimum_delay_is_nonblocking_and_counts_real_work(tmp_path, monkeypatch
         assert heartbeats == 4
         assert status.deleted
         assert not services.sessions.current((10, 10)).busy
+
+    asyncio.run(run())
+
+
+def _identification_with(matches):
+    buffer = io.BytesIO()
+    Image.new("RGB", (20, 20), "white").save(buffer, format="PNG")
+    prep = SimpleNamespace(original_crop=Image.new("RGB", (20, 20), "white"))
+    return Identification("welcome baby", SimpleNamespace(confidence=43), prep,
+                          matches, buffer.getvalue(), 1, 0.2, False)
+
+
+class FileMessage(Message):
+    def __init__(self):
+        super().__init__()
+        self.chat = SimpleNamespace(id=10, type="private")
+        self.documents = []
+
+    async def reply_document(self, document, **kwargs):
+        self.documents.append((getattr(document, "name", ""), kwargs.get("filename")))
+
+
+def test_font_file_button_offers_only_candidates_with_a_real_file(tmp_path, monkeypatch):
+    async def run():
+        monkeypatch.setenv("OWNER_TELEGRAM_ID", "10")
+        services = Services.create(tmp_path)
+        font = tmp_path / "owner-script.ttf"
+        font.write_bytes(b"\x00\x01\x00\x00fake")
+        token = services.sessions.put((10, 10), b"image")
+        services.sessions.finish((10, 10), token, "welcome baby", False, result=_identification_with([
+            FontMatch("owner:1", "Owner Script", "owner", str(font), 0.9, 0.8, 0.1, 0.1, 0.8, source="owner"),
+            FontMatch("ext-1", "Remote Family", "sans-serif", "", 0.7, 0.6, 0.1, 0.1, 0.6,
+                      source="external:WhatFontIs"),
+        ]))
+        message = FileMessage()
+        answers = []
+
+        async def answer(text="", **kwargs):
+            answers.append(text)
+
+        query = SimpleNamespace(data=f"file:{token}", message=message, answer=answer)
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=10),
+                                 effective_chat=SimpleNamespace(id=10, type="private"))
+        context = SimpleNamespace(bot_data={"services": services})
+        await bot.handle_callback(update, context)
+        # The card alone must never send a file.
+        assert message.documents == []
+        assert message.replies and "أنهي خط" in message.replies[-1][0]
+        rows = message.replies[-1][1].__dict__.get("reply_markup")
+        assert rows is None  # Message stub keeps kwargs out; assert via callback below
+
+        pick = SimpleNamespace(data=f"filepick:{token}:0", message=message, answer=answer)
+        update = SimpleNamespace(callback_query=pick, effective_user=SimpleNamespace(id=10),
+                                 effective_chat=SimpleNamespace(id=10, type="private"))
+        await bot.handle_callback(update, context)
+        assert len(message.documents) == 1
+        assert message.documents[0][1] == "Owner Script Regular.ttf"
+        assert "جاري إرسال" in answers[-1]
+
+    asyncio.run(run())
+
+
+def test_font_file_is_owner_only(tmp_path, monkeypatch):
+    async def run():
+        monkeypatch.setenv("OWNER_TELEGRAM_ID", "999")
+        services = Services.create(tmp_path)
+        token = services.sessions.put((10, 10), b"image")
+        services.sessions.finish((10, 10), token, "welcome baby", False, result=result())
+        message = FileMessage()
+        alerts = []
+
+        async def answer(text="", **kwargs):
+            alerts.append((text, kwargs.get("show_alert")))
+
+        query = SimpleNamespace(data=f"file:{token}", message=message, answer=answer)
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=10),
+                                 effective_chat=SimpleNamespace(id=10, type="private"))
+        await bot.handle_callback(update, SimpleNamespace(bot_data={"services": services}))
+        assert alerts and alerts[-1][1] is True
+        assert message.documents == [] and not message.replies
+
+    asyncio.run(run())
+
+
+def test_font_file_refuses_when_no_local_file_exists(tmp_path, monkeypatch):
+    async def run():
+        monkeypatch.setenv("OWNER_TELEGRAM_ID", "10")
+        services = Services.create(tmp_path)
+        token = services.sessions.put((10, 10), b"image")
+        services.sessions.finish((10, 10), token, "welcome baby", False, result=result())
+        message = FileMessage()
+
+        async def answer(text="", **kwargs):
+            pass
+
+        query = SimpleNamespace(data=f"file:{token}", message=message, answer=answer)
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=10),
+                                 effective_chat=SimpleNamespace(id=10, type="private"))
+        await bot.handle_callback(update, SimpleNamespace(bot_data={"services": services}))
+        assert message.documents == []
+        assert "مفيش ملف خط" in message.replies[-1][0]
 
     asyncio.run(run())
