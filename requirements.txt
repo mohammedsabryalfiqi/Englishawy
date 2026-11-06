@@ -1,5 +1,17 @@
+# Englishawy v3 — محرك تحديد خطوط محلي بالكامل (Tesseract + Google Fonts + DINOv2)
 python-telegram-bot==21.6
-requests==2.32.3
-beautifulsoup4==4.12.3
 python-dotenv==1.0.1
+requests>=2.32.3
+
+# المعالجة البصرية ومطابقة الأشكال
 Pillow>=10.3.0
+numpy>=1.26
+opencv-python-headless>=4.9
+
+# القراءة العصبية للحروف + التصحيح القاموسي
+tesserocr>=2.6.2
+wordfreq>=3.0.3
+rapidfuzz>=3.6
+
+# إعادة الترتيب العصبي (DINOv2 ONNX على CPU بدون torch)
+onnxruntime>=1.17

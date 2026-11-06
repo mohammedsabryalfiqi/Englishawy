@@ -1,122 +1,143 @@
 """
-preprocessor.py — وحدة المعالجة البصرية المسبقة وعزل الحروف (مثل WhatTheFont / WhatFontIs)
-========================================================================================
-تعالج أهم سبب لعدم دقة التعرف في النسخة الأولى:
-1. اكتشاف الخلفيات الغامقة تلقائياً وعكسها بحيث تصبح الحروف سوداء على خلفية بيضاء.
-2. قص الهوامش الفارغة حول النص تلقائياً (Auto-Crop Text ROI).
-3. تعزيز التباين والحدة أو تطبيق Otsu-like Binarization لفصل الحروف عن الخلفية.
-4. استخراج متجه البصمة الهندسية (8D Glyph Vector) للمطابقة مع مستودع السيرفر الخارجي.
+preprocessor.py — المعالجة البصرية المسبقة لعزل النص وتجهيزه للـ OCR والمطابقة
+==============================================================================
+ينتج:
+  *.reference_crop*: نسخة ثنائية نظيفة ومقصوصة بإحكام من الكلمة (تُستخدم في مطابقة
+   الأشكال وفي خانة "ORIGINAL CROP" ببطاقة المقارنة).
+  *variants*: عدة معالجات مختلفة للصورة تُمرَّر كلها إلى Tesseract ثم يُصوّت على
+   نتائجها (هذا ما يرفع دقة قراءة الحروف بشكل كبير مقارنة بمعالجة واحدة).
+
+لا يعتمد على أي خدمة خارجية؛ OpenCV + Pillow فقط.
 """
 
+from __future__ import annotations
+
 import io
+from dataclasses import dataclass, field
+
+import cv2
+import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 
-def preprocess_font_image(
+@dataclass
+class PreprocessResult:
+    reference_crop: Image.Image          # ثنائي (أسود على أبيض) مقصوص بإحكام
+    original_crop: Image.Image           # قص أصلي بالألوان للعرض في البطاقة
+    variants: list[tuple[str, Image.Image]] = field(default_factory=list)
+    inverted: bool = False
+    summary: str = ""
+
+
+def _to_gray(img: Image.Image) -> np.ndarray:
+    return np.asarray(ImageOps.grayscale(img))
+
+
+def _ensure_dark_on_light(gray: np.ndarray, force_invert: bool) -> tuple[np.ndarray, bool]:
+    """يقلب الألوان إذا كانت الخلفية داكنة (الحروف يجب أن تكون داكنة على فاتح)."""
+    border = np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])
+    bg = float(np.median(border))
+    inv = force_invert or bg < 128
+    if inv:
+        gray = 255 - gray
+    return gray, inv
+
+
+def _tight_crop(binary: np.ndarray, pad: int = 6) -> np.ndarray:
+    ys, xs = np.where(binary > 0)
+    if len(xs) == 0:
+        return binary
+    x0, x1 = max(0, xs.min() - pad), min(binary.shape[1], xs.max() + pad + 1)
+    y0, y1 = max(0, ys.min() - pad), min(binary.shape[0], ys.max() + pad + 1)
+    return binary[y0:y1, x0:x1]
+
+
+def _otsu(gray: np.ndarray) -> np.ndarray:
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return th  # حبر=0 خلفية=255
+
+
+def preprocess(
     image_bytes: bytes,
     force_invert: bool = False,
     force_binarize: bool = False,
-) -> dict:
+) -> PreprocessResult:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    # تصغير أو تكبير الصورة إذا كانت صغيرة جداً أو ضخمة جداً لتحسين دقة OCR
     w, h = img.size
-    if max(w, h) > 1600:
-        scale = 1600 / float(max(w, h))
-        img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
-    elif max(w, h) < 400:
-        scale = 600 / float(max(1, max(w, h)))
-        img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+    # تكبير الصور الصغيرة يساعد Tesseract كثيراً
+    scale = 1.0
+    if max(w, h) < 700:
+        scale = 700 / max(w, h)
+    elif max(w, h) > 2200:
+        scale = 2200 / max(w, h)
+    if scale != 1.0:
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
 
-    gray = ImageOps.grayscale(img)
+    gray = _to_gray(img)
+    gray, inverted = _ensure_dark_on_light(gray, force_invert)
 
-    # حساب متوسط سطوع الخلفية والأطراف لمعرفة ما إذا كانت الخلفية داكنة
-    hist = gray.histogram()
-    total_px = max(1, sum(hist))
-    avg_lum = sum(i * hist[i] for i in range(256)) / total_px
+    # قص منطقة النص من الصورة الأصلية للعرض
+    bin0 = _otsu(gray)
+    ink0 = (bin0 == 0).astype(np.uint8)
+    ink0 = cv2.morphologyEx(ink0, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    ys, xs = np.where(ink0 > 0)
+    if len(xs):
+        pad = 10
+        x0, x1 = max(0, xs.min() - pad), min(gray.shape[1], xs.max() + pad + 1)
+        y0, y1 = max(0, ys.min() - pad), min(gray.shape[0], ys.max() + pad + 1)
+        original_crop = img.crop((x0, y0, x1, y1))
+        gray_c = gray[y0:y1, x0:x1]
+    else:
+        original_crop = img
+        gray_c = gray
 
-    inverted = False
-    if force_invert or avg_lum < 118:
-        gray = ImageOps.invert(gray)
-        inverted = True
-
-    # تعزيز التباين والحدة
-    gray = ImageOps.autocontrast(gray, cutoff=2)
-    gray = ImageEnhance.Contrast(gray).enhance(1.75)
-    gray = gray.filter(ImageFilter.SHARPEN)
-
-    # تطبيق عزل ثنائي حاد (Binarization) عند الطلب
+    # المرجع الثنائي المقصوص بإحكام (للمطابقة الشكلية)
+    ref_bin = _otsu(gray_c)
     if force_binarize:
-        threshold = 148
-        gray = gray.point(lambda p: 255 if p > threshold else 0)
+        ref_bin = cv2.threshold(gray_c, 140, 255, cv2.THRESH_BINARY)[1]
+    ref_ink = _tight_crop((ref_bin == 0).astype(np.uint8) * 255, pad=4)
+    ref_img = Image.fromarray(255 - ref_ink).convert("L")  # أسود على أبيض
 
-    # قص الهوامش البيضاء الفارغة حول الكلمة مع ترك هامش أمان (Padding)
-    inv_for_bbox = ImageOps.invert(gray).point(lambda p: 255 if p > 60 else 0)
-    bbox = inv_for_bbox.getbbox()
-    if bbox:
-        pad_x = max(12, int(gray.width * 0.04))
-        pad_y = max(12, int(gray.height * 0.08))
-        left = max(0, bbox[0] - pad_x)
-        top = max(0, bbox[1] - pad_y)
-        right = min(gray.width, bbox[2] + pad_x)
-        bottom = min(gray.height, bbox[3] + pad_y)
-        if (right - left) > 40 and (bottom - top) > 20:
-            gray = gray.crop((left, top, right, bottom))
+    # بناء عدة معالجات للتصويت في OCR
+    g = Image.fromarray(gray_c)
+    big = g.resize((g.width * 2, g.height * 2), Image.Resampling.LANCZOS)
+    auto = ImageOps.autocontrast(g, cutoff=1)
+    auto_big = auto.resize((auto.width * 2, auto.height * 2), Image.Resampling.LANCZOS)
+    sharp = auto_big.filter(ImageFilter.UnsharpMask(radius=2, percent=160, threshold=2))
+    otsu_big = Image.fromarray(_otsu(np.asarray(auto_big)))
+    adapt = cv2.adaptiveThreshold(
+        np.asarray(auto_big), 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 12
+    )
+    adapt_img = Image.fromarray(adapt)
+    mild = ImageEnhance.Contrast(auto).enhance(1.4)
 
-    # استخراج متجه مبدئي للبصمة الهندسية من الصورة المعالجة
-    glyph_vector = _extract_glyph_vector(gray)
-
-    out_buf = io.BytesIO()
-    gray.convert("RGB").save(out_buf, format="PNG", optimize=True)
-
-    summary_parts = [
-        f"Size={gray.width}x{gray.height}",
-        "Polarity=Inverted" if inverted else "Polarity=Normal",
-        "Mode=Binarized" if force_binarize else "Mode=EnhancedGray",
+    variants = [
+        ("gray", g),
+        ("auto", auto),
+        ("auto2x", auto_big),
+        ("sharp2x", sharp),
+        ("otsu2x", otsu_big),
+        ("adaptive", adapt_img),
+        ("contrast", mild),
+        ("big2x", big),
     ]
 
-    return {
-        "image_bytes": out_buf.getvalue(),
-        "glyph_vector": glyph_vector,
-        "summary": " | ".join(summary_parts),
-    }
+    summary = (
+        f"{ref_img.width}x{ref_img.height}px | "
+        f"{'معكوس' if inverted else 'طبيعي'} | "
+        f"{'ثنائي' if force_binarize else 'رمادي'} | {len(variants)} معالجات"
+    )
+    return PreprocessResult(
+        reference_crop=ref_img,
+        original_crop=original_crop.convert("RGB"),
+        variants=variants,
+        inverted=inverted,
+        summary=summary,
+    )
 
 
-def _extract_glyph_vector(gray_img: Image.Image) -> dict:
-    """يحسب كثافة الحبر ونسب الانتقال الأفقي والرأسي لتقدير خصائص الخط."""
-    sample = gray_img.resize((240, 80), Image.Resampling.BILINEAR)
-    px = list(sample.getdata())
-    w, h = 240, 80
-
-    ink_count = 0
-    horiz_edges = 0
-    vert_edges = 0
-
-    for y in range(h - 1):
-        row_offset = y * w
-        for x in range(w - 1):
-            idx = row_offset + x
-            is_ink = px[idx] < 140
-            if is_ink:
-                ink_count += 1
-            right_ink = px[idx + 1] < 140
-            down_ink = px[idx + w] < 140
-            if is_ink != right_ink:
-                horiz_edges += 1
-            if is_ink != down_ink:
-                vert_edges += 1
-
-    ink_density = round(min(0.65, max(0.12, ink_count / float(w * h))), 3)
-    edge_ratio = vert_edges / float(max(1, horiz_edges))
-    est_serif = round(min(0.95, max(0.04, (edge_ratio - 0.55) * 1.25)), 2)
-    est_contrast = round(min(0.92, max(0.08, est_serif * 0.82 + 0.08)), 2)
-    est_weight = int(min(850, max(400, round(430 + ink_density * 720))))
-
-    return {
-        "serif_score": est_serif,
-        "stroke_contrast": est_contrast,
-        "x_height_ratio": 0.70,
-        "width_ratio": 0.98,
-        "weight_score": est_weight,
-        "slope_angle": 0.0,
-    }
+def to_ink_array(img: Image.Image) -> np.ndarray:
+    """يحول صورة (حبر داكن على فاتح) إلى مصفوفة حبر 0/1 بإحكام."""
+    a = np.asarray(ImageOps.grayscale(img))
+    ink = (a < 160).astype(np.uint8)
+    return _tight_crop(ink, pad=2)

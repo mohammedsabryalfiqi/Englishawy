@@ -1,0 +1,18 @@
+# أصول ثقيلة تُنزّل عبر setup_assets.py (لا تُرفع إلى git)
+.cache/
+*.onnx
+*.traineddata
+*.ttf
+
+# بيئة بايثون
+.venv/
+__pycache__/
+*.pyc
+
+# إعدادات محلية
+.env
+*.sqlite3
+
+# مخرجات تجريبية
+demo_out/
+*.part

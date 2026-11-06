@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# سكربت رفع التحديثات مباشرة إلى مستودع GitHub الخاص بك:
+# سكربت رفع تحديثات Englishawy v3 إلى مستودع GitHub الخاص بك:
 # https://github.com/mohammedsabryalfiqi/Englishawy.git
+# ملاحظة: الأصول الثقيلة (.cache/) مستثناة عبر .gitignore ولا تُرفع.
 
 set -e
 
-echo "🚀 جاري تجهيز ورفع تحديثات Englishawy v2.4 إلى GitHub..."
+echo "🚀 جاري تجهيز ورفع تحديثات Englishawy v3 إلى GitHub..."
 
 if [ ! -d ".git" ]; then
   git init
-  git branch -M main
   git remote add origin https://github.com/mohammedsabryalfiqi/Englishawy.git || true
 fi
 
-git add bot.py preprocessor.py whatfontis.py dafont.py external_vault.py fonts_vault.json requirements.txt .env.example README.md
-git commit -m "feat(v2.4): upgrade font recognition with image preprocessing, external server font vault, smart name normalizer, and interactive Telegram re-analysis"
-git push -u origin main
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 
-echo "✅ تم تحديث المستودع على GitHub بنجاح!"
+git add .gitignore bot.py pipeline.py preprocessor.py ocr_engine.py font_matcher.py \
+        neural_reranker.py comparison_card.py setup_assets.py identify_cli.py \
+        font_manifest.json requirements.txt .env.example README.md push_to_github.sh
+git commit -m "feat(v3): local AI font identification (Tesseract voting + Google Fonts shape match + DINOv2 rerank) with visual comparison card, no download links" || true
+git push -u origin "$BRANCH"
+
+echo "✅ تم رفع التحديثات على الفرع: $BRANCH"
