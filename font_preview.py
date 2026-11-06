@@ -1,11 +1,15 @@
-"""Render the user's actual word for external matches, without downloading fonts.
+"""Fetch a real preview image for an externally matched font.
 
-WhatFontIs' public font page exposes a custom-text image endpoint in the #ct
-section. Discover that endpoint from the page (never guess a font ID), request
-the OCR text, validate the image, and cache a re-encoded PNG outside Git.
-Only public WhatFontIs HTTPS hosts are allowed; API credentials are never sent
-to the page or preview server. A specimen alphabet is NOT passed off as the
-user's word when custom rendering is unavailable.
+The identification API returns three specimen strips per match — uppercase,
+lowercase and extra glyphs — drawn in the matched family. Those are the only
+images still served for a font: the on-site custom-text renderer the old
+implementation scraped (#ct / index.php?p=refresh) was removed upstream, so every
+external row fell through to "Preview unavailable".
+
+We download one specimen, validate it (real ink, sane size), re-encode it as a
+local PNG and cache it outside Git. Only the provider's own HTTPS image hosts are
+reachable; API credentials never leave the API call. The card labels a specimen
+as a sample instead of passing it off as the user's own word.
 """
 from __future__ import annotations
 
@@ -13,12 +17,10 @@ import hashlib
 import io
 import logging
 import os
-import re
 import threading
 import time
 import urllib.parse
 import uuid
-from html.parser import HTMLParser
 from pathlib import Path
 
 import numpy as np
@@ -29,14 +31,13 @@ from config import CACHE_DIR
 
 logger = logging.getLogger(__name__)
 PREVIEW_DIR = CACHE_DIR / "previews"
-PAGE_HOSTS = {"whatfontis.com", "www.whatfontis.com"}
-PREVIEW_HOSTS = PAGE_HOSTS | {"img.whatfontis.com", "imgall.whatfontis.com"}
-MAX_PAGE_BYTES = 1_500_000
+PREVIEW_HOSTS = {"d1ly52g9wjvbd2.cloudfront.net", "img.whatfontis.com", "imgall.whatfontis.com",
+                 "www.whatfontis.com", "whatfontis.com"}
 MAX_IMAGE_BYTES = 3_000_000
 MAX_CACHE_FILES = 256
 CACHE_TTL = 7 * 86400
 _CACHE_LOCK = threading.Lock()
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; EnglishawyBot/5.1)", "Accept-Language": "en"}
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; EnglishawyBot/5.2)", "Accept-Language": "en"}
 
 
 def _safe_url(url: str, hosts: set[str]) -> str | None:
@@ -49,7 +50,7 @@ def _safe_url(url: str, hosts: set[str]) -> str | None:
             or parsed.username is not None or parsed.password is not None
             or port not in {None, 443}):
         return None
-    # Fragments are client-side only; drop them so canonical #ct links work.
+    # Fragments are client-side only; drop them so cached keys stay canonical.
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
 
 
@@ -77,53 +78,7 @@ def _get(url: str, hosts: set[str], limit: int, timeout: tuple[float, float], ac
                         return None
                 return bytes(data)
     except requests.RequestException as exc:
-        logger.info("WhatFontIs preview request failed: %s", type(exc).__name__)
-    return None
-
-
-class _PreviewImages(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.urls: list[tuple[bool, str]] = []
-        self._in_custom = False
-
-    def handle_starttag(self, tag, attrs):
-        values = dict(attrs)
-        if values.get("name") == "ct" or values.get("id") in {"ct", "sample"}:
-            self._in_custom = True
-        if tag != "img":
-            return
-        for key in ("data-src", "data-lazy-src", "src"):
-            value = values.get(key)
-            if value:
-                self.urls.append((self._in_custom,
-                                  urllib.parse.urljoin("https://www.whatfontis.com/", value)))
-
-
-def custom_preview_endpoint(page_html: str, text: str) -> str | None:
-    """Find the public #ct renderer and substitute the requested text safely."""
-    parser = _PreviewImages()
-    try:
-        parser.feed(page_html[:MAX_PAGE_BYTES])
-    except Exception:
-        return None
-    # Prefer the #ct/custom-text section over unrelated specimen/related-font images.
-    for prefer_custom in (True, False):
-        for in_custom, url in parser.urls:
-            if prefer_custom and not in_custom:
-                continue
-            try:
-                parts = urllib.parse.urlsplit(url)
-                query = urllib.parse.parse_qs(parts.query)
-            except ValueError:
-                continue
-            if (parts.scheme not in {"https", ""} or parts.hostname not in PREVIEW_HOSTS
-                    or parts.path != "/index.php" or query.get("p") != ["refresh"]
-                    or not re.fullmatch(r"\d{1,12}", query.get("id", [""])[0])):
-                continue
-            query["text"] = [text]
-            return urllib.parse.urlunsplit(("https", parts.hostname, "/index.php",
-                                            urllib.parse.urlencode(query, doseq=True), ""))
+        logger.info("Specimen preview request failed: %s", type(exc).__name__)
     return None
 
 
@@ -153,8 +108,8 @@ def _validated_image(raw: bytes) -> Image.Image | None:
         return None
 
 
-def _cache_path(page_url: str, text: str) -> Path:
-    key = hashlib.sha256(f"{page_url}\x00{text}".encode()).hexdigest()
+def _cache_path(url: str) -> Path:
+    key = hashlib.sha256(url.encode()).hexdigest()
     return PREVIEW_DIR / f"{key}.png"
 
 
@@ -183,28 +138,26 @@ def _write_cache(path: Path, image: Image.Image) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def whatfontis_preview(page_url: str, text: str, budget: float = 12.0) -> Image.Image | None:
-    """Return a real image of TEXT, or None. Never substitute another font."""
+def specimen_preview(urls, budget: float = 8.0) -> Image.Image | None:
+    """Return the first usable specimen image, or None.
+
+    ``urls`` are the provider's own image links from the identification response,
+    already validated by the caller. Nothing is fetched from anywhere else.
+    """
     deadline = time.monotonic() + max(0.1, budget)
-    text = " ".join(text.split())[:160]
-    page_url = _safe_url(page_url, PAGE_HOSTS) if page_url else None
-    if not text or page_url is None:
-        return None
-    cache = _cache_path(page_url, text)
-    cached = _read_cache(cache)
-    if cached is not None:
-        return cached
-    parts = urllib.parse.urlsplit(page_url)
-    page_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path,
-                                       urllib.parse.urlencode({"text": text}), ""))
-    raw_page = _get(page_url, PAGE_HOSTS, MAX_PAGE_BYTES, (4, 6), "text/html", deadline)
-    if not raw_page:
-        return None
-    endpoint = custom_preview_endpoint(raw_page.decode("utf-8", errors="replace"), text)
-    if endpoint is None:
-        logger.info("WhatFontIs custom preview endpoint unavailable for this font")
-        return None
-    image = _validated_image(_get(endpoint, PREVIEW_HOSTS, MAX_IMAGE_BYTES, (4, 8), "image/*", deadline) or b"")
-    if image is not None:
-        _write_cache(cache, image)
-    return image
+    for url in urls or ():
+        target = _safe_url(str(url), PREVIEW_HOSTS)
+        if target is None:
+            continue
+        cache = _cache_path(target)
+        cached = _read_cache(cache)
+        if cached is not None:
+            return cached
+        raw = _get(target, PREVIEW_HOSTS, MAX_IMAGE_BYTES, (4, 6), "image/*", deadline) or b""
+        image = _validated_image(raw)
+        if image is not None:
+            _write_cache(cache, image)
+            return image
+        if time.monotonic() >= deadline:
+            break
+    return None

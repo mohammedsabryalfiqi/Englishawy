@@ -146,7 +146,7 @@ def query_whatfontis(image_bytes: bytes, ocr_text: str = "", timeout: int = 15,
     if not api_key:
         logger.info("WhatFontIs: API key not set, skipping.")
         if report is not None:
-            report.notices.append("مفتاح WhatFontIs غير مضبوط")
+            report.notices.append("مفتاح البحث الخارجي غير مضبوط")
         return []
     try:
         b64 = base64.b64encode(image_bytes).decode("ascii")
@@ -164,11 +164,11 @@ def query_whatfontis(image_bytes: bytes, ocr_text: str = "", timeout: int = 15,
             # Provider errors may echo request data. Log only a safe category.
             logger.warning("WhatFontIs API returned an error response")
             if report is not None:
-                report.notices.append("WhatFontIs رفض الطلب؛ راجع المفتاح/الرصيد")
+                report.notices.append("خدمة البحث الخارجي رفضت الطلب؛ راجع المفتاح/الرصيد")
             return []
         if not isinstance(data, list):
             if report is not None:
-                report.notices.append("رد غير متوقع من WhatFontIs")
+                report.notices.append("رد غير متوقع من خدمة البحث الخارجي")
             return []
         out: list[ExternalMatch] = []
         for idx, item in enumerate(data[:5]):
@@ -188,13 +188,13 @@ def query_whatfontis(image_bytes: bytes, ocr_text: str = "", timeout: int = 15,
     except urllib.error.HTTPError as exc:
         logger.warning("WhatFontIs HTTP status: %s", exc.code)
         if report is not None:
-            hint = "انتهى رصيد/حد طلبات WhatFontIs" if exc.code == 429 else "تعذر اتصال WhatFontIs؛ راجع المفتاح أو الشبكة"
+            hint = "انتهى رصيد/حد طلبات البحث الخارجي" if exc.code == 429 else "تعذر الاتصال بالبحث الخارجي؛ راجع المفتاح أو الشبكة"
             report.notices.append(hint)
         return []
     except Exception as exc:
         logger.info("WhatFontIs query fallback: %s", type(exc).__name__)
         if report is not None:
-            report.notices.append("تعذر الاتصال بـ WhatFontIs")
+            report.notices.append("تعذر الاتصال بخدمة البحث الخارجي")
         return []
 
 

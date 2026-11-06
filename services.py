@@ -29,6 +29,9 @@ class ImageSession:
     text: str = ""
     owner_only: bool = False
     busy: bool = False
+    # Last Identification, kept so a corrected word can re-render the card
+    # without repeating the whole search.
+    result: object | None = None
 
 
 class ImageSessions:
@@ -77,13 +80,16 @@ class ImageSessions:
             item.busy = True
             return True
 
-    def finish(self, key: tuple[int, int], token: str, text: str = "", owner_only: bool = False) -> None:
+    def finish(self, key: tuple[int, int], token: str, text: str = "", owner_only: bool = False,
+               result: object | None = None) -> None:
         with self._lock:
             item = self.state(key, token)
             if item is not None:
                 item.busy = False
                 item.text = text or item.text
                 item.owner_only = owner_only
+                if result is not None:
+                    item.result = result
 
 @dataclass
 class Services:

@@ -1,9 +1,10 @@
 """Englishawy Telegram bot v5 — cascade search + background GitHub ingest.
 
-Search order for EVERY photo:
-  1) MyFonts WhatTheFont  (https://www.myfonts.com/pages/whatthefont) — FIRST
-  2) WhatFontIs           (https://www.whatfontis.com/)                — SECOND
-  3) Owner library fallback (Google + owner faces + DINOv2) — when no strong match
+Search for EVERY photo — both sources at the same time, one merged list:
+  1) External provider search (network)
+  2) Owner library + Google faces + DINOv2 rerank (local)
+  Reciprocal Rank Fusion merges the two ranked lists. A family both sources
+  name outranks anything a single source likes alone.
 
 Owner GitHub import (bot downloads it HIMSELF in background):
   /import_github https://github.com/<owner>/<repo>[/tree/<branch>/<subpath>]
@@ -12,7 +13,8 @@ Owner GitHub import (bot downloads it HIMSELF in background):
   closing the browser NEVER stops it. Track with /jobs.
 
 Owner identity always comes from update.effective_user.id (private chat only).
-Results contain names + rendered previews, never font download links.
+Results contain names + rendered previews; the font file itself is sent only
+when the owner taps "📄 ابعت ملف الخط" on a card.
 """
 from __future__ import annotations
 
@@ -26,12 +28,13 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import BotCommand, BotCommandScopeAllChatAdministrators, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, BotCommandScopeAllChatAdministrators, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 import assets_runtime
+from comparison_card import render_card
 from config import FONT_SUFFIXES, admin_telegram_ids, is_admin, is_owner, owner_telegram_id, reply_delay_seconds, storage_status, whatfontis_api_key
 from font_store import format_import_report
 from github_ingestor import parse_github_url
@@ -75,18 +78,21 @@ def _admin(update: Update) -> bool:
 def _keyboard(token: str) -> InlineKeyboardMarkup:
     # Bot API 9.4+ supports real button colors. Keep the emoji as a fallback
     # for older Telegram clients that ignore `style`.
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ صحيحة", callback_data=f"vote:{token}:correct", style="success"),
-        InlineKeyboardButton("❌ خاطئة", callback_data=f"vote:{token}:wrong", style="danger"),
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ صحيحة", callback_data=f"vote:{token}:correct", style="success"),
+         InlineKeyboardButton("❌ خاطئة", callback_data=f"vote:{token}:wrong", style="danger")],
+        [InlineKeyboardButton("✏️ الكلمة غلط — عدّلها", callback_data=f"fix:{token}")],
+        # The file is sent only after an explicit tap — never with the card.
+        [InlineKeyboardButton("📄 ابعت ملف الخط", callback_data=f"file:{token}")],
+    ])
 
 
 def _source_label(match) -> str:
     src = str(getattr(match, "source", ""))
-    if src.startswith("external:WhatTheFont"):
-        return "WhatTheFont"
-    if src.startswith("external:WhatFontIs"):
-        return "WhatFontIs"
+    if src == "merged":
+        return "بحث خارجي + مكتبتك"
+    if src.startswith("external:"):
+        return "بحث خارجي"
     if src == "owner":
         return "مكتبتك"
     return "Google"
@@ -97,9 +103,62 @@ def _caption(result: Identification) -> str:
         return "لم أجد خطاً مطابقاً."
     best = result.matches[0]
     caption = f"🎯 {best.family}\n📌 {_source_label(best)}"
-    if result.fallback_used and result.notices:
+    # A merged result is not a fallback, but its notices still matter (low
+    # confidence, neural rerank skipped) — show them either way.
+    if result.notices:
         caption += f"\n⚠️ {result.notices[0]}"
     return caption[:1024]
+
+
+MAX_FONT_FILE = 45 * 1024 * 1024  # Bot API upload ceiling
+
+
+def _font_file_name(match) -> str:
+    suffix = Path(str(getattr(match, "font_path", "") or "")).suffix or ".ttf"
+    name = f"{getattr(match, 'family', 'font')} {getattr(match, 'style', '')}".strip()
+    name = re.sub(r'[\\/:*?"<>|\r\n]+', "-", name).strip(" .-") or "font"
+    return f"{name[:80]}{suffix}"
+
+
+async def _send_font_file(query, context, match) -> bool:
+    """Send the real TTF/OTF — only ever after the user taps the button.
+
+    Google and owner-library faces both carry a real file on disk. An
+    external-only family has no file unless it also lives in the library, and
+    that is said plainly instead of pretending to send something.
+    """
+    path = Path(str(getattr(match, "font_path", "") or ""))
+    if not path.is_file():
+        await query.message.reply_text(
+            "⚠️ الخط ده معنديش ملفه — الاسم جاي من البحث الخارجي بس، "
+            "وملفات الخطوط بتتبعت لما تكون موجودة في مكتبتك.")
+        return False
+    try:
+        if path.stat().st_size > MAX_FONT_FILE:
+            await query.message.reply_text("⚠️ ملف الخط أكبر من حد تيليجرام (45MB).")
+            return False
+    except OSError:
+        await query.message.reply_text("⚠️ مش قادر أقرأ ملف الخط ده.")
+        return False
+    name = _font_file_name(match)
+    caption = f"📄 {getattr(match, 'family', 'font')}"
+    bot = getattr(context, "bot", None)
+    chat = query.message.chat
+    owner_id = owner_telegram_id()
+    try:
+        with path.open("rb") as handle:
+            if (chat.type == "private" and chat.id == owner_id) or bot is None:
+                await query.message.reply_document(document=handle, filename=name, caption=caption)
+            else:
+                # The button can be tapped from a group card; the file itself
+                # goes to the owner's private chat, not to the group.
+                await bot.send_document(chat_id=owner_id, document=handle, filename=name, caption=caption)
+                await query.message.reply_text("📄 بعتلك ملف الخط في الخاص.")
+    except TelegramError:
+        logger.error("Font file delivery failed")
+        await query.message.reply_text("⚠️ تعذر إرسال ملف الخط؛ جرّب تاني.")
+        return False
+    return True
 
 
 async def _identify_async(services: Services, image: bytes, mode: str, text: str | None,
@@ -128,8 +187,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     stats = await asyncio.to_thread(_services(context).catalog.stats)
     await update.message.reply_text(
-        f"🔎 WhatTheFont ← WhatFontIs ← مكتبة المالك\n"
-        f"WhatFontIs: {'مفتاح مضبوط' if whatfontis_api_key() else 'المفتاح غير مضبوط'}\n"
+        f"🔎 بحث خارجي ← مكتبتك ← Google\n"
+        f"البحث الخارجي: {'مفتاح مضبوط' if whatfontis_api_key() else 'المفتاح غير مضبوط'}\n"
         f"Google: {stats['google']} خط\nمكتبة المالك: {stats['owner']['faces']} وجه / {stats['owner']['families']} عائلة\n"
         f"⏱️ وقت الرد المضبوط: {reply_delay_seconds():.0f} ثانية على الأقل\n"
         f"{storage_status()['label']}")
@@ -276,7 +335,7 @@ async def _analyze_and_respond(update: Update, context: ContextTypes.DEFAULT_TYP
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        services.sessions.finish(key, token, result.text if result else (text or ""), owner_only)
+        services.sessions.finish(key, token, result.text if result else (text or ""), owner_only, result=result)
     if not result.text or not result.matches:
         message = ("📚 مكتبة المالك فارغة أو مافيها نتيجة مطابقة. ابعت صورة أوضح." if owner_only
                    else "⚠️ لم أجد نصاً/خطاً واضحاً. جرّب قصّ الكلمة بصورة أوضح.")
@@ -369,6 +428,11 @@ async def login_hint(update: Update):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     incoming = (update.message.text or "").strip()
+    # After "✏️ الكلمة غلط", the next plain message is the corrected word.
+    fix = context.user_data.pop("word_fix", None) if context.user_data else None
+    if fix and incoming and time.monotonic() < fix.get("until", 0) and not GITHUB_URL_RE.search(incoming):
+        await _apply_word_fix(update, context, fix, incoming)
+        return
     # Owner pastes a GitHub repo link directly (no command needed).
     m = GITHUB_URL_RE.search(incoming)
     if m and _owner(update):
@@ -378,23 +442,118 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ابعت 📸 صورة فيها كلمة إنجليزية، وهرد باسم الخط ومعاينته فقط.\n"
         "لو عايز تصحح النص، ابعت الصورة ومعاها الكابتشن الصحيح.\n"
-        "(البحث: WhatTheFont ← WhatFontIs ← مكتبة المالك)")
+        "(البحث: خارجي + مكتبتك في نفس الوقت، وملف الخط يتبعت لما تطلبه)")
+
+
+async def _apply_word_fix(update: Update, context: ContextTypes.DEFAULT_TYPE, fix: dict, word: str):
+    """Redraw the card with the corrected word, keeping the same candidates."""
+    key = _key(update)
+    services = _services(context)
+    state = services.sessions.state(key, fix.get("token", "")) if key else None
+    if state is None:
+        await update.message.reply_text("⌛ جلسة الصورة انتهت؛ ابعتها تاني وأنا أعرض البطاقة بالكلمة الصحيحة.")
+        return
+    word = (word or "").strip()[:160]
+    if not word:
+        await update.message.reply_text("✏️ ابعت الكلمة الصحيحة نفسها.")
+        return
+    result = getattr(state, "result", None)
+    if result is None:
+        # No cached render (session from an older version): redo the search.
+        fresh = services.sessions.put(key, state.image)
+        status = await update.message.reply_text("✏️ بحدّث الكلمة وأعيد المقارنة...")
+        await _analyze_and_respond(update, context, status, state.image, "auto", word, fresh)
+        return
+    try:
+        card = await asyncio.to_thread(render_card, result.prep.original_crop, word,
+                                       result.matches, len(result.matches), None)
+    except Exception as exc:
+        logger.error("Word refresh failed: %s", type(exc).__name__)
+        await update.message.reply_text("⚠️ تعذر تحديث الكلمة. ابعت الصورة تاني.")
+        return
+    state.text = word
+    caption = (_caption(result) + f"\n✏️ الكلمة في المعاينة: {word}")[:1024]
+    chat = update.effective_chat
+    await chat.send_action(ChatAction.UPLOAD_PHOTO)
+    media = InputMediaPhoto(media=io.BytesIO(card), caption=caption)
+    bot = getattr(context, "bot", None)
+    if bot is not None and fix.get("chat_id") and fix.get("message_id"):
+        try:
+            await bot.edit_message_media(chat_id=fix["chat_id"], message_id=fix["message_id"],
+                                         media=media, reply_markup=_keyboard(state.token))
+            return
+        except TelegramError:
+            pass
+    await chat.send_photo(photo=io.BytesIO(card), caption=caption, reply_markup=_keyboard(state.token))
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     key = _key(update)
-    data = query.data or "" if query else ""
-    parts = data.split(":")
-    state = _services(context).sessions.state(key, parts[1]) if key and len(parts) == 3 and parts[0] == "vote" else None
+    data = (query.data if query else "") or ""
+    kind, _, rest = data.partition(":")
+    token = rest.split(":")[0] if rest else ""
+    state = _services(context).sessions.state(key, token) if key and token else None
     if not query or not query.message or state is None:
         if query:
             await query.answer("انتهت جلسة الصورة؛ ابعتها تاني.", show_alert=True)
         return
-    if parts[2] == "correct":
+    if kind == "fix":
+        await query.answer()
+        context.user_data["word_fix"] = {
+            "token": state.token,
+            "chat_id": query.message.chat_id,
+            "message_id": query.message.message_id,
+            "until": time.monotonic() + 600,
+        }
+        await query.message.reply_text(
+            "✏️ اكتب الكلمة الصحيحة كما تظهر في الصورة، وأنا أحدّث المعاينة على طول.")
+        return
+    if kind in {"file", "filepick"}:
+        user = update.effective_user
+        if user is None or user.id != owner_telegram_id():
+            await query.answer("📄 إرسال ملفات الخطوط متاح لصاحب البوت فقط.", show_alert=True)
+            return
+        cached = getattr(state, "result", None)
+        matches = list(getattr(cached, "matches", []) or [])
+        if kind == "filepick":
+            try:
+                index = int(rest.split(":", 1)[1])
+            except (IndexError, ValueError):
+                await query.answer("⌛ حدّد الخط من القائمة.", show_alert=True)
+                return
+            if not 0 <= index < len(matches):
+                await query.answer("⌛ النتيجة دي قديمة؛ ابعث الصورة تاني.", show_alert=True)
+                return
+            await query.answer("📄 جاري إرسال ملف الخط...")
+            await _send_font_file(query, context, matches[index])
+            return
+        await query.answer()
+        if not matches:
+            await query.message.reply_text("⚠️ مفيش نتائج محفوظة للصورة دي؛ ابعتها تاني.")
+            return
+        choices = [(index, match) for index, match in enumerate(matches)
+                   if getattr(match, "font_path", "")]
+        if not choices:
+            await query.message.reply_text(
+                "⚠️ مفيش ملف خط موجود عندي للنتيجة دي — الأسماء دي جاية من البحث الخارجي بس. "
+                "لو ضفت الخط للمكتبة هقدر أبعتهولك كملف.")
+            return
+        # One row per match, one short label: no giant text in a group card.
+        rows = [[InlineKeyboardButton((f"{index + 1}. {match.family}"[:58]),
+                                      callback_data=f"filepick:{state.token}:{index}")]
+                for index, match in choices]
+        await query.message.reply_text("📄 أنهي خط أبعتهولك ملفه TTF/OTF؟",
+                                       reply_markup=InlineKeyboardMarkup(rows))
+        return
+    if kind != "vote":
+        await query.answer()
+        return
+    action = rest.partition(":")[2]
+    if action == "correct":
         await query.answer("✅ تم تأكيد النتيجة.")
         return
-    if parts[2] != "wrong":
+    if action != "wrong":
         await query.answer()
         return
     if state.owner_only:

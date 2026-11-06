@@ -50,6 +50,11 @@ class FontMatch:
     style: str = "Regular"
     preview_image: Image.Image | None = field(default=None, repr=False)
     source_url: str = ""
+    # Filled by neural_reranker.blend_scores and by the pipeline merge. Kept as
+    # optional fields so every consumer can read them through getattr without
+    # caring whether a given match ever went through the neural pass.
+    neural_sim: float | None = None
+    final_score: float | None = None
 
 
 @lru_cache(maxsize=1)
@@ -69,7 +74,7 @@ def load_index() -> list[dict]:
     return out
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=8192)
 def _font_obj(path: str, size: int, face_index: int = 0) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(path, size, index=face_index)
 
@@ -196,6 +201,51 @@ def _score(m: dict) -> float:
     )
 
 
+def score_pair(ref_img: Image.Image, cand_img: Image.Image) -> tuple[float, dict]:
+    """Full metric pass for one candidate: composite score plus its components."""
+    metrics = compare_to_reference(ref_img, cand_img)
+    return _score(metrics), metrics
+
+
+# ---- المرحلة الخفيفة قبل المقارنة الكاملة ---------------------------------
+# The library can hold thousands of faces (owner uploads + Google). Rendering
+# and fully comparing every one of them at 160 px is what made the library
+# stage feel slow. A small render plus a cheap overlap score cuts the list to
+# a shortlist, and only the survivors pay for the full metric pass.
+
+COARSE_SIZE = 56
+COARSE_W, COARSE_H = 160, 48
+
+
+def _coarse_signature(ref_img: Image.Image) -> tuple[np.ndarray, float]:
+    ref = _tight(_ink(ref_img))
+    height, width = ref.shape
+    aspect = width / max(1, height)
+    thumb = cv2.resize(ref, (COARSE_W, COARSE_H), interpolation=cv2.INTER_AREA)
+    return thumb, aspect
+
+
+def _coarse_score(signature: tuple[np.ndarray, float], cand: Image.Image) -> float:
+    ref_thumb, ref_aspect = signature
+    ink = _tight(_ink(cand))
+    height, width = ink.shape
+    aspect_diff = abs(np.log((width / max(1, height) + 1e-6) / (ref_aspect + 1e-6)))
+    thumb = cv2.resize(ink, (COARSE_W, COARSE_H), interpolation=cv2.INTER_AREA)
+    inter = float(np.minimum(ref_thumb, thumb).sum())
+    union = float(np.maximum(ref_thumb, thumb).sum())
+    iou = inter / union if union > 0 else 0.0
+    return 0.72 * iou + 0.28 * float(np.exp(-aspect_diff * 1.4))
+
+
+def _report(progress, done: int, total: int) -> None:
+    if progress is None:
+        return
+    try:
+        progress(done, total)
+    except Exception:  # a UI progress bar must never break a search
+        pass
+
+
 def match_fonts(
     ref_img: Image.Image,
     text: str,
@@ -208,21 +258,42 @@ def match_fonts(
     if limit and fonts is None:
         index = index[:limit]
     total = len(index)
-    results: list[FontMatch] = []
+    if total == 0:
+        return [], 0
+
+    # المرحلة الأولى: رسم صغير + درجة تقاطع رخيصة لكل الخطوط. هذا يحوّل
+    # المسح من O(N × المقارنة الكاملة) إلى O(N × رسم صغير) + مقارنة كاملة
+    # لقائمة قصيرة فقط.
+    signature = _coarse_signature(ref_img)
+    shortlisted: list[tuple[float, dict, str, int]] = []
     for i, entry in enumerate(index):
         path = entry.get("path") or str(CACHE_DIR / entry["file"])
         face_index = int(entry.get("face_index", 0))
+        small = render_text(path, text, size=COARSE_SIZE, face_index=face_index)
+        if small is not None:
+            shortlisted.append((_coarse_score(signature, small), entry, path, face_index))
+        if i % 50 == 0:
+            _report(progress, i + 1, total)
+    _report(progress, total, total)
+
+    shortlisted.sort(key=lambda item: item[0], reverse=True)
+    # سقف القائمة القصيرة: كافٍ لالتقاط أفضل المرشحين لكل نمط، وقليل بما
+    # يكفي لجعل المقارنة الكاملة سريعة. لا يقلّ عن 120 حتى لمكتبة صغيرة.
+    keep = min(len(shortlisted), max(4 * max(1, top_k), 120))
+
+    results: list[FontMatch] = []
+    for coarse, entry, path, face_index in shortlisted[:keep]:
         cand = render_text(path, text, face_index=face_index)
         if cand is None:
             continue
-        m = compare_to_reference(ref_img, cand)
+        score, m = score_pair(ref_img, cand)
         results.append(
             FontMatch(
                 slug=entry["slug"],
                 family=entry.get("family", entry["slug"]),
                 category=entry.get("category", ""),
                 font_path=path,
-                score=_score(m),
+                score=score,
                 iou=m["iou"],
                 aspect_diff=m["aspect_diff"],
                 weight_diff=m["weight_diff"],
@@ -232,7 +303,5 @@ def match_fonts(
                 style=entry.get("style", "Regular"),
             )
         )
-        if progress and (i % 50 == 0 or i + 1 == total):
-            progress(i + 1, total)
     results.sort(key=lambda x: x.score, reverse=True)
     return results[:top_k], total
