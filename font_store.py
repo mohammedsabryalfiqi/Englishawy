@@ -40,6 +40,8 @@ class FontStore:
         self.fonts_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._size_cache: tuple[int, float] = (0, 0.0)
+        self._size_busy = False
         with self._connect() as conn:
             conn.executescript("""
                 PRAGMA journal_mode=DELETE;
@@ -253,18 +255,43 @@ class FontStore:
                                     (f"%{query}%", f"%{query}%", limit, offset)).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM fonts WHERE enabled=1 ORDER BY family,id LIMIT ? OFFSET ?", (limit, offset)).fetchall()
-        return [self._row_dict(r) for r in rows if Path(r["path"]).is_file()]
+        # لا نفحص is_file لكل صف: على Volume شبكي كل stat بطيء وكان يجمّد لوحة المالك.
+        return [self._row_dict(r) for r in rows]
 
     def all_entries(self) -> list[dict]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM fonts WHERE enabled=1 ORDER BY id").fetchall()
+            # بدون analysis_json: عمود ثقيل لا يحتاجه المسح ويضاعف الذاكرة مع المكتبات الكبيرة
+            rows = conn.execute("SELECT id, content_sha, face_index, family, style, category, path, origin "
+                                "FROM fonts WHERE enabled=1 ORDER BY id").fetchall()
         return [self._row_dict(r) for r in rows]
 
     def stats(self) -> dict:
         with self._connect() as conn:
             row = conn.execute("SELECT COUNT(*) faces, COUNT(DISTINCT family) families, COUNT(DISTINCT content_sha) files FROM fonts WHERE enabled=1").fetchone()
-        size = sum(p.stat().st_size for p in self.fonts_dir.iterdir() if p.is_file() and not p.name.startswith(".part-"))
-        return {"faces": row["faces"], "families": row["families"], "files": row["files"], "bytes": size}
+        return {"faces": row["faces"], "families": row["families"], "files": row["files"],
+                "bytes": self._bytes_cached()}
+
+    def _bytes_cached(self) -> int:
+        """Total size needs one stat() per file - minutes on a network Volume. Compute it in the
+        background (single-flight, refreshed every 10 min) and always answer instantly."""
+        value, stamp = self._size_cache
+        if time.time() - stamp > 600 and not self._size_busy:
+            self._size_busy = True
+            threading.Thread(target=self._refresh_size, name="library-size", daemon=True).start()
+        return value
+
+    def _refresh_size(self) -> None:
+        try:
+            total = 0
+            for p in self.fonts_dir.iterdir():
+                if not p.name.startswith(".part-"):
+                    try:
+                        total += p.stat().st_size
+                    except OSError:
+                        pass
+            self._size_cache = (total, time.time())
+        finally:
+            self._size_busy = False
 
     def delete(self, font_id: int) -> bool:
         with self._lock, self._connect() as conn:

@@ -23,6 +23,7 @@ import io
 import logging
 import os
 import re
+import threading
 import tempfile
 import time
 from pathlib import Path
@@ -34,6 +35,7 @@ from telegram.error import TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 import assets_runtime
+from diag import dump_threads
 from comparison_card import render_card
 from config import FONT_SUFFIXES, admin_telegram_ids, is_admin, is_owner, owner_telegram_id, reply_delay_seconds, storage_status, whatfontis_api_key
 from font_store import format_import_report
@@ -110,6 +112,8 @@ def _caption(result: Identification) -> str:
     return caption[:1024]
 
 
+IDENTIFY_TIMEOUT_S = float(os.getenv("IDENTIFY_TIMEOUT_S", "300"))
+SLOW_DUMP_S = float(os.getenv("SLOW_DUMP_S", "45"))
 MAX_FONT_FILE = 45 * 1024 * 1024  # Bot API upload ceiling
 
 
@@ -161,14 +165,25 @@ async def _send_font_file(query, context, match) -> bool:
     return True
 
 
+async def threads_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: where is every thread right now (used to find a stuck analysis)."""
+    if not _owner(update):
+        return
+    await update.message.reply_text(("🧵 Threads:\n" + dump_threads())[:4000])
+
+
 async def _identify_async(services: Services, image: bytes, mode: str, text: str | None,
-                          owner_only: bool = False) -> Identification:
+                          owner_only: bool = False, cancel: threading.Event | None = None) -> Identification:
     fonts = await asyncio.to_thread(services.catalog.fonts, "owner" if owner_only else "all")
+    ready, total = services.catalog.mirror_progress() if hasattr(services.catalog, "mirror_progress") else (0, 0)
     async with services.analysis_semaphore:
-        return await asyncio.to_thread(identify, image, top_n=MAX_RESULTS, candidates=CANDIDATES,
+        result = await asyncio.to_thread(identify, image, top_n=MAX_RESULTS, candidates=CANDIDATES,
                                        force_invert=mode == "invert", force_binarize=mode == "binarize",
                                        text_override=text, font_limit=FONT_LIMIT,
-                                       fonts=fonts, external_first=not owner_only)
+                                       fonts=fonts, external_first=not owner_only, cancel=cancel)
+    if total and ready < total:
+        result.notices.append(f"⏳ لسه بجهّز مكتبتك على القرص المحلي ({ready}/{total}) — النتيجة من الجاهز حالياً.")
+    return result
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -305,12 +320,22 @@ async def _analyze_and_respond(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     started = time.monotonic() if started is None else started
     delay = reply_delay_seconds()
-    task = asyncio.create_task(_identify_async(services, image, mode, text, owner_only))
+    cancel = threading.Event()
+    task = asyncio.create_task(_identify_async(services, image, mode, text, owner_only, cancel=cancel))
     result = None
     try:
         await status.edit_text("🔎 بفحص الصورة ومراجعة الخطوط..." if not owner_only else "📚 بفحص مكتبة المالك فقط...")
+        dumped = False
         while not task.done():
             done, _ = await asyncio.wait({task}, timeout=4)
+            elapsed = time.monotonic() - started
+            if not done and elapsed > SLOW_DUMP_S and not dumped:
+                dumped = True  # مرة واحدة: يبيّن في اللوج أين يقف التحليل
+                logger.warning("Analysis still running after %.0fs. Threads:\n%s", elapsed, dump_threads())
+            if not done and elapsed > IDENTIFY_TIMEOUT_S:
+                logger.error("Analysis TIMEOUT after %.0fs. Threads:\n%s", elapsed, dump_threads())
+                cancel.set()
+                raise TimeoutError("identification timeout")
             if not done:
                 try:
                     await status.edit_text("🔎 لسه بفحص أشكال الحروف وأجهّز المعاينة...")
@@ -327,12 +352,17 @@ async def _analyze_and_respond(update: Update, context: ContextTypes.DEFAULT_TYP
                 pass
             await asyncio.sleep(min(4, remaining))
             remaining = delay - (time.monotonic() - started)
+    except TimeoutError:
+        await status.edit_text("⏱️ التحليل خد وقت أطول من المسموح فأوقفته. ابعت الصورة تاني، "
+                               "ولو اتكرر ابعت /threads (للمالك) أو اللوج.")
+        return
     except Exception as exc:
         logger.error("Identification failed: %s", type(exc).__name__)
         await status.edit_text("⚠️ تعذر التحليل. جرّب صورة أوضح أو تأكد من تجهيز المكتبة.")
         return
     finally:
         if not task.done():
+            cancel.set()  # يوقف خيط المسح الفعلي؛ task.cancel وحده لا يوقفه
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         services.sessions.finish(key, token, result.text if result else (text or ""), owner_only, result=result)
@@ -629,7 +659,7 @@ def register_handlers(application: Application, services: Services) -> None:
     for command, handler in [("start", start), ("help", start), ("status", status_command),
                              ("login", login), ("owner", owner_status), ("fonts", list_fonts),
                              ("removefont", remove_font), ("import_github", import_github),
-                             ("jobs", jobs_command)]:
+                             ("jobs", jobs_command), ("threads", threads_command)]:
         application.add_handler(CommandHandler(command, handler))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -642,7 +672,7 @@ def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env or the environment")
-    builder = (Application.builder().token(token).concurrent_updates(4)
+    builder = (Application.builder().token(token).concurrent_updates(int(os.getenv("BOT_CONCURRENT_UPDATES", "16")))
                .post_init(post_init).connect_timeout(15).read_timeout(30)
                .write_timeout(30).pool_timeout(15).get_updates_read_timeout(35))
     if os.getenv("TELEGRAM_LOCAL_API", "0").lower() in {"1", "true", "yes"}:

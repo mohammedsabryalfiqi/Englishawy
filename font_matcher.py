@@ -16,8 +16,13 @@ font_matcher.py — مطابقة أشكال الحروف عبر مكتبة خط�
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import subprocess
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -74,15 +79,20 @@ def load_index() -> list[dict]:
     return out
 
 
-@lru_cache(maxsize=8192)
+# كان الكاش 8192 كائن خط مفتوح (كل واحد يُبقي ملف الخط في الذاكرة): مع مكتبة كبيرة
+# كانت الرام تنفد ويُعاد تشغيل الـ Space. المسح الخفيف لا يستخدم الكاش أصلاً (cache=False)،
+# وهذا الكاش يخدم فقط القائمة القصيرة وإعادة الترتيب العصبي.
+@lru_cache(maxsize=int(os.getenv("FONT_OBJ_CACHE", "256")))
 def _font_obj(path: str, size: int, face_index: int = 0) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(path, size, index=face_index)
 
 
-def render_text(font_path: str, text: str, size: int = 160, face_index: int = 0) -> Image.Image | None:
+def render_text(font_path: str, text: str, size: int = 160, face_index: int = 0,
+                cache: bool = True) -> Image.Image | None:
     """يرسم النص بالخط ويعيد صورة رمادية مقصوصة بإحكام (أسود على أبيض)."""
     try:
-        font = _font_obj(font_path, size, face_index)
+        font = (_font_obj(font_path, size, face_index) if cache
+                else ImageFont.truetype(font_path, size, index=face_index))
         bbox = font.getbbox(text)
         if not bbox:
             return None
@@ -246,6 +256,41 @@ def _report(progress, done: int, total: int) -> None:
         pass
 
 
+SCAN_WORKERS = max(1, int(os.getenv("MATCH_WORKERS", str(min(3, os.cpu_count() or 2)))))
+SCAN_CHUNK = max(20, int(os.getenv("MATCH_CHUNK", "300")))          # خطوط لكل عملية فرعية
+MAX_FONT_MB = float(os.getenv("MATCH_MAX_FONT_MB", "60"))          # تخطّي الملفات العملاقة فقط
+CHUNK_TIMEOUT_S = float(os.getenv("MATCH_CHUNK_TIMEOUT_S", "180"))
+USE_SUBPROCESS = os.getenv("MATCH_SUBPROCESS", "1").lower() not in {"0", "false", "no"}
+_WORKER = Path(__file__).resolve().with_name("font_scan_worker.py")
+
+
+def coarse_entry(entry: dict, text: str, signature, max_mb: float = MAX_FONT_MB) -> float | None:
+    """Cheap score for ONE font (small render, never cached). None = cannot render / too big."""
+    path = entry.get("path") or str(CACHE_DIR / entry["file"])
+    try:
+        if os.path.getsize(path) > max_mb * 1048576:
+            return None
+    except OSError:
+        return None
+    small = render_text(path, text, size=COARSE_SIZE, face_index=int(entry.get("face_index", 0)), cache=False)
+    return None if small is None else _coarse_score(signature, small)
+
+
+def _coarse_chunk_subprocess(batch: list[dict], text: str, ref_hex: str) -> list | None:
+    """One chunk in a short-lived child process: memory is returned to the OS afterwards,
+    the server's event loop never shares the GIL with the scan, and a crash stays contained."""
+    job = {"entries": [{k: e.get(k) for k in ("path", "file", "face_index") if e.get(k) is not None}
+                       for e in batch],
+           "text": text, "ref_png_hex": ref_hex, "max_mb": MAX_FONT_MB}
+    env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
+    try:
+        proc = subprocess.run([sys.executable, str(_WORKER)], input=json.dumps(job).encode("utf-8"),
+                              capture_output=True, timeout=CHUNK_TIMEOUT_S, env=env, cwd=str(_WORKER.parent))
+        return json.loads(proc.stdout.decode("utf-8")) if proc.returncode == 0 else None
+    except Exception:
+        return None
+
+
 def match_fonts(
     ref_img: Image.Image,
     text: str,
@@ -253,6 +298,8 @@ def match_fonts(
     limit: int | None = None,
     progress=None,
     fonts: list[dict] | None = None,
+    cancel: threading.Event | None = None,
+    stats: dict | None = None,
 ) -> tuple[list[FontMatch], int]:
     index = fonts if fonts is not None else load_index()
     if limit and fonts is None:
@@ -261,20 +308,49 @@ def match_fonts(
     if total == 0:
         return [], 0
 
-    # المرحلة الأولى: رسم صغير + درجة تقاطع رخيصة لكل الخطوط. هذا يحوّل
-    # المسح من O(N × المقارنة الكاملة) إلى O(N × رسم صغير) + مقارنة كاملة
-    # لقائمة قصيرة فقط.
+    # المرحلة الأولى: رسم صغير + درجة تقاطع رخيصة لكل الخطوط (المكتبة كلها، بلا حدّ زمني).
+    # تُنفَّذ على دفعات في عمليات فرعية متوازية فلا يتجمّد السيرفر ولا تتراكم الذاكرة.
     signature = _coarse_signature(ref_img)
-    shortlisted: list[tuple[float, dict, str, int]] = []
-    for i, entry in enumerate(index):
-        path = entry.get("path") or str(CACHE_DIR / entry["file"])
-        face_index = int(entry.get("face_index", 0))
-        small = render_text(path, text, size=COARSE_SIZE, face_index=face_index)
-        if small is not None:
-            shortlisted.append((_coarse_score(signature, small), entry, path, face_index))
-        if i % 50 == 0:
-            _report(progress, i + 1, total)
+    ref_buf = io.BytesIO()
+    ref_img.convert("L").save(ref_buf, format="PNG")
+    ref_hex = ref_buf.getvalue().hex()
+    scores: list[float | None] = [None] * total
+    state = {"done": 0, "failed": 0}
+    lock = threading.Lock()
+
+    def run_chunk(start: int) -> None:
+        if cancel is not None and cancel.is_set():
+            return
+        batch = index[start:start + SCAN_CHUNK]
+        rows = _coarse_chunk_subprocess(batch, text, ref_hex) if USE_SUBPROCESS else None
+        if rows is not None:
+            for i, value in rows:
+                scores[start + i] = value
+        else:  # العملية الفرعية فشلت (أو معطّلة): مسح داخلي لهذه الدفعة فقط
+            if USE_SUBPROCESS:
+                with lock:
+                    state["failed"] += 1
+            for i, entry in enumerate(batch):
+                if cancel is not None and cancel.is_set():
+                    break
+                scores[start + i] = coarse_entry(entry, text, signature)
+        with lock:
+            state["done"] += len(batch)
+            _report(progress, min(total, state["done"]), total)
+
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        list(pool.map(run_chunk, range(0, total, SCAN_CHUNK)))
+    if cancel is not None and cancel.is_set():
+        raise RuntimeError("أُلغي التحليل")
     _report(progress, total, total)
+    shortlisted: list[tuple[float, dict, str, int]] = []
+    for value, entry in zip(scores, index):
+        if value is not None:
+            shortlisted.append((value, entry, entry.get("path") or str(CACHE_DIR / entry["file"]),
+                                int(entry.get("face_index", 0))))
+    if stats is not None:
+        stats.update({"scanned": state["done"], "total": total, "failed_chunks": state["failed"],
+                      "skipped": total - len(shortlisted)})
 
     shortlisted.sort(key=lambda item: item[0], reverse=True)
     # سقف القائمة القصيرة: كافٍ لالتقاط أفضل المرشحين لكل نمط، وقليل بما

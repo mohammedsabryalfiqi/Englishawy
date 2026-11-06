@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 os.environ.setdefault("GRADIO_SSR_MODE", "False")
@@ -74,7 +75,8 @@ def _library_stats() -> str:
     stats = services.catalog.stats()
     owner = stats["owner"]
     return (f"### المكتبة\n**Google:** {stats['google']} خط  \n"
-            f"**المالك:** {owner['faces']} وجه، {owner['families']} عائلة، {owner['bytes']/1048576:.1f} MB")
+            f"**المالك:** {owner['faces']} وجه، {owner['families']} عائلة، {owner['bytes']/1048576:.1f} MB  \n"
+            f"**جاهز للمسح السريع:** {owner.get('mirrored', 0)}/{owner.get('mirror_total', 0)} ملف خط (نسخة محلية)")
 
 
 def runtime_status() -> str:
@@ -387,6 +389,7 @@ def make_lifespan(inner=None):
             active_app.state.englishawy_routes_mounted = True
         logger.info("Englishawy startup: preparing assets and Telegram transport")
         assets_runtime.start()
+        threading.Thread(target=services.catalog.warm, name="mirror-warm", daemon=True).start()
         if bridge and not bridge.started:
             try:
                 await bridge.start()

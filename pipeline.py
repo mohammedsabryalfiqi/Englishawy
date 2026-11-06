@@ -10,11 +10,15 @@ together and Reciprocal Rank Fusion turns both ranked lists into one.
 from __future__ import annotations
 
 import io
+import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 
@@ -162,6 +166,7 @@ def identify(
     fonts: list[dict] | None = None,
     neural_backend: Callable[[np.ndarray, np.ndarray], list[float]] | None = None,
     external_first: bool = True,
+    cancel: threading.Event | None = None,
 ) -> Identification:
     if not 1 <= int(top_n) <= 10 or not 1 <= int(candidates) <= 64:
         raise ValueError("Invalid result/candidate count")
@@ -173,6 +178,7 @@ def identify(
     t = time.time()
     prep = preprocess(image_bytes, force_invert=force_invert, force_binarize=force_binarize)
     timings["preprocess"] = round(time.time() - t, 2)
+    logger.info("stage preprocess done %.1fs", timings["preprocess"])
 
     t = time.time()
     if text_override and text_override.strip():
@@ -180,6 +186,7 @@ def identify(
     else:
         ocr = read_text(prep.variants)
     timings["ocr"] = round(time.time() - t, 2)
+    logger.info("stage ocr done %.1fs text=%r", timings["ocr"], (ocr.text or "")[:40])
 
     matches: list[FontMatch] = []
     count = len(fonts) if fonts is not None else 0
@@ -197,9 +204,11 @@ def identify(
         nonlocal backend_name, count
         t0 = time.time()
         found, total = match_fonts(prep.reference_crop, ocr.text, top_k=candidates,
-                                   limit=font_limit, progress=progress, fonts=fonts)
+                                   limit=font_limit, progress=progress, fonts=fonts,
+                                   cancel=cancel)
         count = total
         timings["shape_match"] = round(time.time() - t0, 2)
+        logger.info("stage library-scan done %.1fs fonts=%d", timings["shape_match"], total)
         if not found:
             return found
         t1 = time.time()
@@ -215,6 +224,7 @@ def identify(
             # The neural pass is a bonus; shape metrics alone must still answer.
             notices.append("تعذر إعادة الترتيب العصبي؛ النتيجة مبنية على تحليل الشكل فقط.")
         timings["neural_rerank"] = round(time.time() - t1, 2)
+        logger.info("stage neural-rerank done %.1fs", timings["neural_rerank"])
         return found
 
     # ---- Both sources, at the same time -----------------------------------
@@ -244,6 +254,7 @@ def identify(
     elif want_local:
         local_list = run_local()
 
+    logger.info("stage sources done; external=%s", "yes" if cascade is not None else "no")
     if cascade is not None:
         notices.extend(cascade.notices)
         timings.update(cascade.timings)

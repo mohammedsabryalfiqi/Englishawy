@@ -168,3 +168,17 @@ python -m pytest -q
 - [Spaces storage / attached volumes](https://huggingface.co/docs/hub/spaces-storage)
 - [Spaces configuration](https://huggingface.co/docs/hub/spaces-config-reference)
 - [Telegram Bot API — getFile](https://core.telegram.org/bots/api#getfile)
+
+## تحليل المكتبة الكبيرة دون تعليق الـ Space
+
+المرحلة الخفيفة (رسم صغير لكل خط في المكتبة كلها، بلا حدّ زمني) تُنفَّذ الآن في عمليات فرعية قصيرة العمر (`font_scan_worker.py`) بدل خيط داخل السيرفر؛ فتعود الذاكرة للنظام بعد كل دفعة ولا يتجمّد البوت. كاش كائنات الخطوط نزل من 8192 إلى 256، و`all_entries()` لا تحمّل `analysis_json`، وإلغاء/إعادة إرسال الصورة يوقف المسح القديم فعلاً. متغيرات اختيارية: `MATCH_WORKERS` (3) · `MATCH_CHUNK` (300) · `MATCH_MAX_FONT_MB` (60) · `MATCH_SUBPROCESS=0` · `FONT_OBJ_CACHE` (256).
+
+## لو التحليل وقف عند «لسه بفحص أشكال الحروف…»
+
+- كل مرحلة تُسجَّل في اللوج (`stage ocr done` / `stage library-scan done` / `stage neural-rerank done` …): آخر سطر يظهر يحدد أين وقف.
+- بعد `SLOW_DUMP_S` (45ث) يكتب البوت في اللوج مكان كل Thread، وبعد `IDENTIFY_TIMEOUT_S` (300ث) يوقف التحليل ويرد برسالة بدل التعليق للأبد. للمالك أيضاً الأمر `/threads` في تليجرام.
+- `BOT_CONCURRENT_UPDATES` (16): كان 4، فإذا علقت 4 تحليلات توقف البوت عن الرد على أي رسالة.
+
+## بطء Volume (`/data`) كان سبب التعليق
+
+الـ Volume شبكي: كل `open`/`stat` عليه بطيء، فمسح آلاف الخطوط منه كان ينتظر I/O بلا CPU ولا رام. الآن تُنسخ ملفات المالك في الخلفية (16 خيطاً) إلى قرص الحاوية المحلي (`ENGLISHAWY_LOCAL_MIRROR`، افتراضي `/tmp/englishawy-mirror`) والمسح يقرأ منه فقط؛ الباقي يظهر في الكابشن «⏳ لسه بجهّز مكتبتك (X/Y)». إحصاءات المكتبة (الحجم) تُحسب في الخلفية ولا تجمّد اللوحة. متغيرات: `MIRROR_WORKERS` (16) · `MIRROR_OWNER_FONTS=0` لإيقافه · `MIRROR_SYNC_LIMIT` (200).

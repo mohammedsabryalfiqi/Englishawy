@@ -47,7 +47,7 @@ class TelegramBridge:
             if not base_url.startswith("https://"):
                 raise ValueError("A public HTTPS URL is required for Telegram webhook mode")
         self.token, self.secret, self.base_url = token, secret, base_url
-        builder = (Application.builder().token(token).concurrent_updates(4)
+        builder = (Application.builder().token(token).concurrent_updates(int(os.getenv("BOT_CONCURRENT_UPDATES", "16")))
                    .post_init(post_init).connect_timeout(15).read_timeout(30)
                    .write_timeout(30).pool_timeout(15).get_updates_read_timeout(35))
         if mode == "webhook":
