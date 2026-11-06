@@ -1,5 +1,5 @@
 """
-font_matcher.py — مطابقة أشكال الحروف عبر مكتبة خطوط Google المحلية
+font_matcher.py — مطابقة أشكال الحروف عبر مكتبة خطوط Google والمالك
 ===================================================================
 سير العمل (المرحلة الثانية):
   1. رسم النص الذي قرأه الـ OCR بكل خط من المكتبة (~1800 خط، قابلة للتقليص).
@@ -45,6 +45,9 @@ class FontMatch:
     aspect_diff: float
     weight_diff: float
     edge_sim: float
+    source: str = "google"
+    face_index: int = 0
+    style: str = "Regular"
 
 
 @lru_cache(maxsize=1)
@@ -65,14 +68,14 @@ def load_index() -> list[dict]:
 
 
 @lru_cache(maxsize=4096)
-def _font_obj(path: str, size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(path, size)
+def _font_obj(path: str, size: int, face_index: int = 0) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(path, size, index=face_index)
 
 
-def render_text(font_path: str, text: str, size: int = 160) -> Image.Image | None:
+def render_text(font_path: str, text: str, size: int = 160, face_index: int = 0) -> Image.Image | None:
     """يرسم النص بالخط ويعيد صورة رمادية مقصوصة بإحكام (أسود على أبيض)."""
     try:
-        font = _font_obj(font_path, size)
+        font = _font_obj(font_path, size, face_index)
         bbox = font.getbbox(text)
         if not bbox:
             return None
@@ -197,14 +200,17 @@ def match_fonts(
     top_k: int = 30,
     limit: int | None = None,
     progress=None,
-) -> list[FontMatch]:
-    index = load_index()
-    if limit:
+    fonts: list[dict] | None = None,
+) -> tuple[list[FontMatch], int]:
+    index = fonts if fonts is not None else load_index()
+    if limit and fonts is None:
         index = index[:limit]
+    total = len(index)
     results: list[FontMatch] = []
     for i, entry in enumerate(index):
-        path = str(CACHE_DIR / entry["file"])
-        cand = render_text(path, text)
+        path = entry.get("path") or str(CACHE_DIR / entry["file"])
+        face_index = int(entry.get("face_index", 0))
+        cand = render_text(path, text, face_index=face_index)
         if cand is None:
             continue
         m = compare_to_reference(ref_img, cand)
@@ -219,9 +225,12 @@ def match_fonts(
                 aspect_diff=m["aspect_diff"],
                 weight_diff=m["weight_diff"],
                 edge_sim=m["edge_sim"],
+                source=entry.get("source", "google"),
+                face_index=face_index,
+                style=entry.get("style", "Regular"),
             )
         )
-        if progress and i % 300 == 0:
-            progress(i, len(index))
+        if progress and (i % 50 == 0 or i + 1 == total):
+            progress(i + 1, total)
     results.sort(key=lambda x: x.score, reverse=True)
-    return results[:top_k]
+    return results[:top_k], total

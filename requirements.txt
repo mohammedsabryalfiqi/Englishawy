@@ -1,17 +1,24 @@
-# Englishawy v3 — محرك تحديد خطوط محلي بالكامل (Tesseract + Google Fonts + DINOv2)
+# Gradio itself is pinned by README.md sdk_version (HF manages that package).
+spaces==0.51.3
+fastapi==0.162.0
+uvicorn==0.54.0
 python-telegram-bot==21.6
 python-dotenv==1.0.1
 requests>=2.32.3
 
-# المعالجة البصرية ومطابقة الأشكال
-Pillow>=10.3.0
-numpy>=1.26
-opencv-python-headless>=4.9
-
-# القراءة العصبية للحروف + التصحيح القاموسي
-tesserocr>=2.6.2
+# Image processing, OCR voting and dictionary correction
+Pillow==11.3.0
+numpy>=1.26,<3
+opencv-python-headless>=4.9,<5
+tesserocr==2.12.0
 wordfreq>=3.0.3
 rapidfuzz>=3.6
 
-# إعادة الترتيب العصبي (DINOv2 ONNX على CPU بدون torch)
-onnxruntime>=1.17
+# Owner font validation / TTC faces / WOFF normalization
+fonttools[woff]==4.68.0
+
+# ZeroGPU PyTorch path (official facebook/dinov2-small) + local CPU fallback.
+# Torch 2.8.0 is in the current official ZeroGPU supported list.
+torch==2.8.0
+transformers==4.57.1
+onnxruntime==1.31.1
