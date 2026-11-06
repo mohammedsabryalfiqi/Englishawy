@@ -27,9 +27,11 @@ from font_store import format_import_report
 from pipeline import identify
 from services import Services
 from telegram_webhook import TelegramBridge, describe_telegram_error, mount_telegram
+from app_github_addon import bind_services, github_job_status, register_github_tab, start_github_import
 
 logger = logging.getLogger(__name__)
 services = Services.create()
+bind_services(services)  # share ONE Services instance with the GitHub tab (no re-import of app.py)
 try:
     bridge = TelegramBridge.from_env(services)
     bridge_error = ""
@@ -126,11 +128,11 @@ def analyze_image(image, text_override, source_label, top_n, backend_label, inve
     progress(0.95, desc="رسم بطاقة المقارنة")
     rows = []
     for index, match in enumerate(result.matches, 1):
-        rows.append([index, match.family, "مكتبة المالك" if match.source == "owner" else "Google Fonts",
+        rows.append([index, match.family, ("WhatTheFont" if str(match.source).endswith("WhatTheFont") else ("WhatFontIs" if str(match.source).endswith("WhatFontIs") else ("مكتبة المالك" if match.source == "owner" else "Google Fonts"))),
                      round(getattr(match, "final_score", match.score) * 100, 1),
                      match.neural_sim if match.neural_sim is not None else "—"])
     note = (f"✅ قرأت: **{result.text}** · ثقة OCR: **{result.ocr.confidence:.0f}%** · "
-            f"{result.font_count} خط · {result.elapsed_s:.1f} ثانية · {result.neural_backend}")
+            f"{result.font_count} خط · {result.elapsed_s:.1f} ثانية · {result.neural_backend} · المصدر الفائز: {getattr(result, 'winning_stage', 'owner_library')}")
     if not result.neural_used:
         note += "\n\n⚠️ الترتيب شكلي فقط؛ نموذج DINOv2 غير متاح في هذا الوضع."
     return Image.open(io.BytesIO(result.card_png)).copy(), rows, result.text, note
@@ -227,7 +229,7 @@ class EnglishawyBlocks(gr.Blocks):
 def build_ui() -> gr.Blocks:
     with EnglishawyBlocks(title="Englishawy — كاشف الخطوط", theme=gr.themes.Soft(primary_hue="teal", neutral_hue="slate"), css=CSS) as demo:
         gr.HTML("""<div class="english-hero"><p class="english-kicker">ENGLISHAWY · FONT INTELLIGENCE · ZEROGPU</p>
-        <h1>اعرف الخط. وشوف أقرب البدائل.</h1><p>من صورة واحدة إلى بطاقة مقارنة حيّة: Tesseract، مطابقة أشكال الحروف عبر Google Fonts ومكتبتك، ثم DINOv2. أسماء ومعاينات فقط — بدون روابط تحميل.</p></div>""")
+        <h1>اعرف الخط. وشوف أقرب البدائل.</h1><p>من صورة واحدة إلى بطاقة مقارنة حيّة: Tesseract، البحث أولاً في WhatTheFont ثم WhatFontIs، ثم مكتبة المالك تلقائياً عند الحاجة، ثم DINOv2. أسماء ومعاينات فقط — بدون روابط تحميل.</p></div>""")
         with gr.Tabs():
             with gr.Tab("🔎 تحديد الخط"):
                 with gr.Row():
@@ -274,22 +276,26 @@ def build_ui() -> gr.Blocks:
                         delete_input = gr.Textbox(label="ID الخط للحذف")
                         delete_button = gr.Button("احذف الخط", variant="stop")
                     delete_status = gr.Markdown()
+                    github_url, github_branch, github_start, github_status, github_jobs = register_github_tab(owner_group)
                 login_button.click(owner_login, inputs=[code_input, token_state], outputs=[token_state, auth_status, login_group, owner_group])
                 import_button.click(import_owner_files, inputs=[file_input, token_state], outputs=[import_status, library_table, library_summary, file_input], concurrency_limit=1)
                 refresh_button.click(refresh_owner_library, inputs=[token_state, search_input], outputs=[library_table, library_summary])
                 logout_button.click(owner_logout, inputs=token_state, outputs=[token_state, auth_status, login_group, owner_group])
                 delete_button.click(delete_owner_font, inputs=[delete_input, token_state, search_input], outputs=[delete_status, library_table, library_summary])
+                github_start.click(start_github_import, inputs=[github_url, github_branch, token_state], outputs=[github_status, github_jobs], concurrency_limit=1)
             with gr.Tab("⚙️ الحالة والتشغيل"):
                 status_output = gr.Markdown(runtime_status)
                 status_button = gr.Button("تحديث الحالة")
                 gr.Markdown("""<div class="english-note"><b>كيف يعمل؟</b><br>
                 ① Tesseract بعدة معالجات: تصويت PSM 7/6/13/11 وتصحيح قاموسي.<br>
-                ② رسم النص ومقارنة القناع والحواف والنسبة والسُمك والبروفايل عبر Google + مكتبة المالك.<br>
-                ③ DINOv2 يعيد ترتيب أفضل 30؛ على Space يستخدم ZeroGPU، ومحلياً CPU ONNX.<br><br>
+                ② البحث أولاً في WhatTheFont ثم WhatFontIs، ثم مكتبة المالك تلقائياً عند غياب تطابق قوي.<br>
+                ③ رسم النص ومقارنة القناع والحواف والنسبة والسُمك والبروفايل عبر Google + مكتبة المالك.<br>
+                ④ DINOv2 يعيد ترتيب أفضل 30؛ على Space يستخدم ZeroGPU، ومحلياً CPU ONNX.<br><br>
                 <b>مهم:</b> اربط Storage Bucket/Volume بمسار البيانات لكي تبقى الخطوط بعد إعادة التشغيل. وجود مجلد قابل للكتابة وحده لا يضمن الحفظ.</div>""")
                 status_button.click(lambda: runtime_status(), outputs=status_output)
                 timer = gr.Timer(15)
                 timer.tick(lambda: runtime_status(), outputs=status_output)
+                timer.tick(github_job_status, outputs=github_jobs)
         gr.Markdown("Englishawy · Gradio + ZeroGPU · Telegram owner library · لا روابط تحميل في النتائج")
     return demo
 
@@ -299,8 +305,12 @@ demo.queue(max_size=32, default_concurrency_limit=1, api_open=False)
 
 
 async def health():
+    telegram = bridge.status() if bridge else {"configured": False, "error": bridge_error or "TELEGRAM_BOT_TOKEN is not set"}
+    if bridge and hasattr(bridge, "webhook_info"):
+        if getattr(bridge, "mode", "webhook") == "webhook":
+            telegram["telegram_side"] = await bridge.webhook_info()
     return {"ok": True, "assets": assets_runtime.snapshot(), "storage": storage_status(),
-            "gpu": zero_gpu.status(), "telegram": bridge.status() if bridge else {"configured": False, "error": bridge_error or "TELEGRAM_BOT_TOKEN is not set"}}
+            "gpu": zero_gpu.status(), "telegram": telegram}
 
 
 def make_lifespan(inner=None):

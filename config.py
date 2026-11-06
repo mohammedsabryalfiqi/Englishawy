@@ -1,4 +1,13 @@
-"""Shared, secret-safe configuration for Gradio, Telegram and the CLI."""
+"""Shared, secret-safe configuration (v5 patched).
+
+New in v5:
+  CASCADE_THRESHOLD  — min external confidence (0..1) before owner fallback.
+                       Default 0.78. Tune via Space Variables (no code change).
+  WHATFONTIS_API_KEY — free key from https://www.whatfontis.com/API-identify-fonts-from-image.html
+  MYFONTS_API_KEY + WHATTHEFONT_API_URL — only for MyFonts enterprise customers.
+                       Without them WhatTheFont is offered as a 1-click manual
+                       deep-link (first option) and the cascade continues.
+"""
 from __future__ import annotations
 
 import os
@@ -31,6 +40,27 @@ def is_owner(user_id: int | None, chat_id: int | None = None, chat_type: str | N
         and (chat_id is None or chat_id == user_id)
         and (chat_type is None or chat_type == "private")
     )
+
+
+def cascade_threshold() -> float:
+    """External-match acceptance threshold (default 0.78)."""
+    try:
+        v = float(os.getenv("CASCADE_THRESHOLD", "0.78"))
+    except ValueError:
+        return 0.78
+    return max(0.0, min(0.99, v))
+
+
+def whatfontis_api_key() -> str:
+    return os.getenv("WHATFONTIS_API_KEY", "").strip()
+
+
+def myfonts_api_key() -> str:
+    return os.getenv("MYFONTS_API_KEY", "").strip()
+
+
+def whatthefont_api_url() -> str:
+    return os.getenv("WHATTHEFONT_API_URL", "").strip()
 
 
 def data_dir() -> Path:

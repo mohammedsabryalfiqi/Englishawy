@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -36,28 +37,56 @@ def describe_telegram_error(exc: Exception) -> str:
 
 
 class TelegramBridge:
-    def __init__(self, services: Services, token: str, secret: str, base_url: str):
-        if len(secret) < 16:
-            raise ValueError("TELEGRAM_WEBHOOK_SECRET must contain at least 16 characters")
-        if not base_url.startswith("https://"):
-            raise ValueError("A public HTTPS URL is required for Telegram webhook mode")
+    def __init__(self, services: Services, token: str, secret: str, base_url: str, mode: str = "webhook"):
+        self.mode = mode
+        if mode == "webhook":
+            if len(secret) < 16:
+                raise ValueError("TELEGRAM_WEBHOOK_SECRET must contain at least 16 characters")
+            if not base_url.startswith("https://"):
+                raise ValueError("A public HTTPS URL is required for Telegram webhook mode")
         self.token, self.secret, self.base_url = token, secret, base_url
-        self.application = Application.builder().token(token).updater(None).concurrent_updates(4).build()
+        builder = Application.builder().token(token).concurrent_updates(4)
+        if mode == "webhook":
+            builder = builder.updater(None)  # polling mode keeps the default Updater
+        self.application = builder.build()
         register_handlers(self.application, services)
         self.queue: asyncio.Queue | None = None
         self.tasks: list[asyncio.Task] = []
         self.started = False
         self.error = ""
+        self.hits = 0            # POST requests that reached /telegram/webhook
+        self.accepted = 0        # valid updates queued
+        self.processed = 0       # updates fully handled
+        self.failed = 0          # handler crashes
+        self.last_hit_at = 0.0
+        self.last_reject = ""
 
     @classmethod
     def from_env(cls, services: Services) -> "TelegramBridge | None":
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
             return None
-        return cls(services, token, os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip(), public_base_url())
+        mode = os.getenv("TELEGRAM_MODE", "webhook").strip().lower()
+        if mode not in {"webhook", "polling"}:
+            raise ValueError("TELEGRAM_MODE must be 'webhook' or 'polling'")
+        base = public_base_url() if mode == "webhook" else ""
+        return cls(services, token, os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip(), base, mode)
 
     async def start(self) -> None:
         await self.application.initialize()
+        if self.mode == "polling":
+            # Works on PRIVATE Spaces too: only outbound calls to api.telegram.org are needed.
+            try:
+                await self.application.bot.delete_webhook(drop_pending_updates=True)
+                await self.application.start()
+                await self.application.updater.start_polling(
+                    allowed_updates=["message", "callback_query"], drop_pending_updates=True)
+                self.started = True
+                logger.info("Telegram polling started")
+            except Exception:
+                await self.stop()
+                raise
+            return
         await self.application.start()
         self.queue = asyncio.Queue(maxsize=128)
         self.tasks = [asyncio.create_task(self._consumer(), name=f"telegram-worker-{i}") for i in range(4)]
@@ -68,6 +97,8 @@ class TelegramBridge:
                 max_connections=40,
             )
             self.started = True
+            info = await self.webhook_info()
+            logger.info("Telegram getWebhookInfo: %s", info)
         except Exception:
             await self.stop()
             raise
@@ -78,12 +109,17 @@ class TelegramBridge:
             update = await self.queue.get()
             try:
                 await self.application.process_update(update)
+                self.processed += 1
             except Exception as exc:
-                logger.error("Telegram update failed: %s", type(exc).__name__)
+                self.failed += 1
+                logger.error("Telegram update %s failed: %s", update.update_id, type(exc).__name__)
             finally:
                 self.queue.task_done()
 
     async def stop(self) -> None:
+        updater = getattr(self.application, "updater", None)
+        if self.mode == "polling" and updater is not None and updater.running:
+            await updater.stop()
         for task in self.tasks:
             task.cancel()
         if self.tasks:
@@ -95,17 +131,35 @@ class TelegramBridge:
             await self.application.shutdown()
         self.started = False
 
+    def _reject(self, reason: str, status: int) -> JSONResponse:
+        self.last_reject = f"{reason} @ {time.strftime('%H:%M:%S')}"
+        logger.warning("Telegram webhook rejected: %s", reason)
+        return JSONResponse({"error": reason}, status_code=status)
+
+    async def webhook_info(self) -> dict:
+        """What Telegram itself says about delivery (never includes the token)."""
+        try:
+            info = await self.application.bot.get_webhook_info()
+        except Exception as exc:
+            return {"error": describe_telegram_error(exc)}
+        return {"url": info.url, "pending_update_count": info.pending_update_count,
+                "last_error_message": info.last_error_message,
+                "last_error_date": info.last_error_date.isoformat() if info.last_error_date else None,
+                "ip_address": info.ip_address}
+
     async def webhook(self, request: Request) -> JSONResponse:
+        self.hits += 1
+        self.last_hit_at = time.time()
         supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if not hmac.compare_digest(supplied, self.secret):
-            return JSONResponse({"error": "forbidden"}, status_code=403)
+            return self._reject("bad or missing secret header", 403)
         length = request.headers.get("content-length")
         if length and (not length.isdigit() or int(length) > MAX_UPDATE_BYTES):
-            return JSONResponse({"error": "update too large"}, status_code=413)
+            return self._reject("update too large", 413)
         body = bytearray()
         async for chunk in request.stream():
             if len(body) + len(chunk) > MAX_UPDATE_BYTES:
-                return JSONResponse({"error": "update too large"}, status_code=413)
+                return self._reject("update too large", 413)
             body.extend(chunk)
         try:
             data = json.loads(body)
@@ -113,17 +167,22 @@ class TelegramBridge:
                 raise ValueError("invalid update")
             update = Update.de_json(data, self.application.bot)
         except (ValueError, TypeError, KeyError):
-            return JSONResponse({"error": "invalid update"}, status_code=400)
+            return self._reject("invalid update", 400)
         if not self.started or self.queue is None:
-            return JSONResponse({"error": "bot not ready"}, status_code=503)
+            return self._reject("bot not ready", 503)
         try:
             self.queue.put_nowait(update)
         except asyncio.QueueFull:
-            return JSONResponse({"error": "busy"}, status_code=503)
+            return self._reject("queue full", 503)
+        self.accepted += 1
+        logger.info("Telegram update %s queued", update.update_id)
         return JSONResponse({"ok": True})
 
     def status(self) -> dict:
-        return {"configured": True, "connected": self.started, "mode": "webhook", "error": self.error}
+        return {"configured": True, "connected": self.started, "mode": self.mode, "error": self.error,
+                "hits": self.hits, "accepted": self.accepted, "processed": self.processed,
+                "failed": self.failed, "last_reject": self.last_reject,
+                "last_hit_secs_ago": round(time.time() - self.last_hit_at) if self.last_hit_at else None}
 
 
 def mount_telegram(app: FastAPI, bridge: TelegramBridge | None) -> None:
