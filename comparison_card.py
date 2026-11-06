@@ -55,17 +55,17 @@ def _ui_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def _font_for(path: str, size: int) -> ImageFont.FreeTypeFont | None:
+def _font_for(path: str, size: int, face_index: int = 0) -> ImageFont.FreeTypeFont | None:
     try:
-        return ImageFont.truetype(path, size)
+        return ImageFont.truetype(path, size, index=face_index)
     except Exception:
         return None
 
 
-def _fit_preview(text: str, font_path: str, max_w: int, max_h: int) -> Image.Image | None:
+def _fit_preview(text: str, font_path: str, max_w: int, max_h: int, face_index: int = 0) -> Image.Image | None:
     """يرسم النص بالخط ويحجّمه ليلائم الإطار مع الحفاظ على النسبة."""
     size = 150
-    f = _font_for(font_path, size)
+    f = _font_for(font_path, size, face_index)
     if f is None:
         return None
     try:
@@ -162,9 +162,16 @@ def render_card(
         d.text((nx + (nb - nw) / 2, ny + 9), num, font=nf, fill=(15, 118, 110))
         # اسم الخط
         family = getattr(m, "family", str(m))
-        d.text((nx + nb + 16, y + 16), family, font=name_f, fill=INK)
+        family_text = family if len(family) <= 43 else family[:40] + "…"
+        d.text((nx + nb + 16, y + 16), family_text, font=name_f, fill=INK)
+        source = getattr(m, "source", "google")
+        badge_text = "OWNER LIBRARY" if source == "owner" else "GOOGLE FONTS"
+        badge_font = _ui_font(10, True)
+        badge_w = d.textlength(badge_text, font=badge_font) + 16
+        d.rounded_rectangle((W - MARGIN - badge_w - 16, y + 15, W - MARGIN - 16, y + 35), radius=8, fill=TEAL_SOFT)
+        d.text((W - MARGIN - badge_w - 8, y + 19), badge_text, font=badge_font, fill=(15, 118, 110))
         # المعاينة الحيّة
-        preview = _fit_preview(text, getattr(m, "font_path", ""), INNER - 110, row_h - 52)
+        preview = _fit_preview(text, getattr(m, "font_path", ""), INNER - 110, row_h - 52, getattr(m, "face_index", 0))
         if preview is not None:
             px = nx + nb + 16
             py = y + 46 + (row_h - 52 - preview.height) // 2
@@ -175,7 +182,7 @@ def render_card(
 
     # ---- تذييل ----
     fy = y + 2
-    note = "Tesseract OCR  ·  Google Fonts shape match  ·  DINOv₂ neural rerank"
+    note = "Tesseract OCR  ·  Google + Owner fonts  ·  DINOv₂ rerank"
     d.text((MARGIN, fy), note, font=_ui_font(12), fill=(120, 135, 158))
 
     buf = io.BytesIO()

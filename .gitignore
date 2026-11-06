@@ -16,3 +16,11 @@ __pycache__/
 # مخرجات تجريبية
 demo_out/
 *.part
+
+# v4 local data / uploads / test output
+data/
+*.zip
+*.woff
+*.woff2
+.pytest_cache/
+comparison_card.png

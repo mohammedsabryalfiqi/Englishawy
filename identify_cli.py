@@ -16,10 +16,11 @@ import sys
 from pathlib import Path
 
 from pipeline import identify
+from services import Services
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Englishawy v3 — تحديد الخطوط محلياً")
+    ap = argparse.ArgumentParser(description="Englishawy v4 — تحديد الخطوط من Google ومكتبة المالك")
     ap.add_argument("image", help="مسار الصورة")
     ap.add_argument("--text", default=None, help="تجاوز الـOCR بنص يدوي")
     ap.add_argument("--top", type=int, default=5)
@@ -28,6 +29,7 @@ def main() -> int:
     ap.add_argument("--invert", action="store_true")
     ap.add_argument("--binarize", action="store_true")
     ap.add_argument("--out", default="comparison_card.png")
+    ap.add_argument("--source", choices=["all", "google", "owner"], default="all")
     args = ap.parse_args()
 
     p = Path(args.image)
@@ -39,6 +41,12 @@ def main() -> int:
         if i % 400 == 0:
             print(f"  مطابقة الأشكال {i}/{n}", flush=True)
 
+    services = Services.create()
+    fonts = services.catalog.fonts(args.source, google_limit=args.limit)
+    if not fonts:
+        print("المكتبة فارغة؛ شغّل setup_assets.py أو أضف خطوط المالك", file=sys.stderr)
+        return 1
+
     r = identify(
         p.read_bytes(),
         top_n=args.top,
@@ -46,7 +54,7 @@ def main() -> int:
         force_invert=args.invert,
         force_binarize=args.binarize,
         text_override=args.text,
-        font_limit=args.limit,
+        fonts=fonts,
         progress=prog,
     )
     print(f"\nالنص المقروء : {r.text!r}  (ثقة {r.ocr.confidence:.0f}%)")
@@ -56,7 +64,7 @@ def main() -> int:
     print("\nأقرب الخطوط:")
     for i, m in enumerate(r.matches, 1):
         print(f"  {i}. {m.family:28s} final={getattr(m,'final_score',m.score):.3f} "
-              f"shape={m.score:.3f} neural={getattr(m,'neural_sim',0):.3f}")
+              f"shape={m.score:.3f} neural={(getattr(m,'neural_sim',None) or 0):.3f} source={m.source}")
     Path(args.out).write_bytes(r.card_png)
     print(f"\nبطاقة المقارنة محفوظة في: {args.out}")
     return 0
