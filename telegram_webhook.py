@@ -10,6 +10,7 @@ import os
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from telegram import Update
+from telegram.error import InvalidToken, NetworkError, TelegramError, TimedOut
 from telegram.ext import Application
 
 from bot import register_handlers
@@ -19,6 +20,19 @@ from services import Services
 logger = logging.getLogger(__name__)
 WEBHOOK_PATH = "/telegram/webhook"
 MAX_UPDATE_BYTES = 1024 * 1024  # JSON metadata only; files are downloaded separately.
+
+
+def describe_telegram_error(exc: Exception) -> str:
+    """Never include exception text that may embed the bot-token URL."""
+    if isinstance(exc, InvalidToken):
+        return "InvalidToken: توكن البوت غير صحيح؛ راجع TELEGRAM_BOT_TOKEN في Space secrets"
+    if isinstance(exc, TimedOut):
+        return "TimedOut: انتهت مهلة الاتصال بتليجرام؛ أعد تشغيل Space أو تحقق من الشبكة"
+    if isinstance(exc, NetworkError):
+        return "NetworkError: تعذر الوصول إلى api.telegram.org من الـSpace"
+    if isinstance(exc, TelegramError):
+        return f"{type(exc).__name__}: رفضت Telegram الطلب؛ تحقق من التوكن وإعدادات Webhook"
+    return f"{type(exc).__name__}: تحقق من التوكن ورابط HTTPS والاتصال بتليجرام"
 
 
 class TelegramBridge:

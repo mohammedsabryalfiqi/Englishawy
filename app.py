@@ -7,6 +7,7 @@ No max_file_size is configured: ZIP size is bounded only by real platform/disk l
 from __future__ import annotations
 
 import io
+from contextlib import AsyncExitStack, asynccontextmanager
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ from config import UPLOAD_SUFFIXES, owner_telegram_id, storage_status
 from font_store import format_import_report
 from pipeline import identify
 from services import Services
-from telegram_webhook import TelegramBridge, mount_telegram
+from telegram_webhook import TelegramBridge, describe_telegram_error, mount_telegram
 
 logger = logging.getLogger(__name__)
 services = Services.create()
@@ -34,6 +35,10 @@ try:
     bridge_error = ""
 except ValueError as exc:
     bridge, bridge_error = None, str(exc)
+if bridge:
+    logger.info("Telegram token detected; webhook will be registered during Gradio startup.")
+else:
+    logger.warning("Telegram bot disabled: %s", bridge_error or "TELEGRAM_BOT_TOKEN is not set in Space secrets")
 
 SOURCE_OPTIONS = {"Google + مكتبتي": "all", "Google Fonts فقط": "google", "مكتبتي فقط": "owner"}
 BACKEND_OPTIONS = {"تلقائي (ZeroGPU إن توفر)": "auto", "CPU / ONNX": "cpu", "ZeroGPU فقط": "gpu"}
@@ -204,8 +209,23 @@ def delete_owner_font(font_id, token, query=""):
     return ("✅ تم حذف الخط." if removed else "لم أجد هذا ID."), _library_table(query), _library_stats()
 
 
+class EnglishawyBlocks(gr.Blocks):
+    """Gradio replaces Blocks.app inside launch(); inject our lifespan into that new app.
+
+    Registering routes on `demo.app` before launch is lost when Gradio creates the
+    server app. The HF Gradio runner calls `demo.launch()`, so this override is the
+    reliable place to attach Telegram/health and run startup on the *active* app.
+    """
+
+    def launch(self, *args, **kwargs):
+        app_kwargs = dict(kwargs.pop("app_kwargs", None) or {})
+        app_kwargs["lifespan"] = make_lifespan(app_kwargs.get("lifespan"))
+        kwargs["app_kwargs"] = app_kwargs
+        return super().launch(*args, **kwargs)
+
+
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Englishawy — كاشف الخطوط", theme=gr.themes.Soft(primary_hue="teal", neutral_hue="slate"), css=CSS) as demo:
+    with EnglishawyBlocks(title="Englishawy — كاشف الخطوط", theme=gr.themes.Soft(primary_hue="teal", neutral_hue="slate"), css=CSS) as demo:
         gr.HTML("""<div class="english-hero"><p class="english-kicker">ENGLISHAWY · FONT INTELLIGENCE · ZEROGPU</p>
         <h1>اعرف الخط. وشوف أقرب البدائل.</h1><p>من صورة واحدة إلى بطاقة مقارنة حيّة: Tesseract، مطابقة أشكال الحروف عبر Google Fonts ومكتبتك، ثم DINOv2. أسماء ومعاينات فقط — بدون روابط تحميل.</p></div>""")
         with gr.Tabs():
@@ -276,31 +296,40 @@ def build_ui() -> gr.Blocks:
 
 demo = build_ui()
 demo.queue(max_size=32, default_concurrency_limit=1, api_open=False)
-app = demo.app
-mount_telegram(app, bridge)
 
 
-@app.get("/health")
 async def health():
     return {"ok": True, "assets": assets_runtime.snapshot(), "storage": storage_status(),
-            "gpu": zero_gpu.status(), "telegram": bridge.status() if bridge else {"configured": False, "error": bridge_error}}
+            "gpu": zero_gpu.status(), "telegram": bridge.status() if bridge else {"configured": False, "error": bridge_error or "TELEGRAM_BOT_TOKEN is not set"}}
 
 
-@app.on_event("startup")
-async def startup():
-    assets_runtime.start()
-    if bridge:
-        try:
-            await bridge.start()
-        except Exception as exc:
-            bridge.error = f"{type(exc).__name__}: تحقق من التوكن ورابط HTTPS والاتصال بتليجرام"
-            logger.error("Telegram webhook startup failed: %s", type(exc).__name__)
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    if bridge:
-        await bridge.stop()
+def make_lifespan(inner=None):
+    @asynccontextmanager
+    async def lifespan(active_app):
+        if not getattr(active_app.state, "englishawy_routes_mounted", False):
+            mount_telegram(active_app, bridge)
+            active_app.add_api_route("/health", health, methods=["GET"])
+            active_app.state.englishawy_routes_mounted = True
+        logger.info("Englishawy startup: preparing assets and Telegram webhook")
+        assets_runtime.start()
+        if bridge and not bridge.started:
+            try:
+                await bridge.start()
+                logger.info("Telegram webhook registered: %s%s", bridge.base_url, "/telegram/webhook")
+            except Exception as exc:
+                bridge.error = describe_telegram_error(exc)
+                logger.error("Telegram webhook startup failed: %s", bridge.error)
+        elif not bridge:
+            logger.warning("Telegram remains disabled: %s", bridge_error or "TELEGRAM_BOT_TOKEN is not set")
+        async with AsyncExitStack() as stack:
+            if inner is not None:
+                await stack.enter_async_context(inner(active_app))
+            try:
+                yield
+            finally:
+                if bridge:
+                    await bridge.stop()
+    return lifespan
 
 
 if __name__ == "__main__":

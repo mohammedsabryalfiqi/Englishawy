@@ -63,6 +63,23 @@ preload_from_hub:
 - إذا انتهت حصة ZeroGPU، يظهر خطأ واضح ويمكن اختيار CPU من الخيارات المتقدمة.
 - الإصدارات المثبتة: Gradio 5.50.0، Python 3.12.12، Torch 2.8.0، Transformers 4.57.1. راجع دليل ZeroGPU الرسمي لأن المنصة تتحدث بمرور الوقت.
 
+## لو البوت لا يرد على Space
+
+اللوج الطبيعي بعد الإصلاح يجب أن يحتوي على:
+
+```text
+Englishawy startup: preparing assets and Telegram webhook
+Telegram webhook registered: https://YOUR-SPACE.hf.space/telegram/webhook
+```
+
+- إذا ظهر `Telegram bot disabled: TELEGRAM_BOT_TOKEN is not set` أضف التوكن في **Settings → Variables and secrets → Secrets** وليس في ملف `.env` داخل المستودع.
+- إذا ظهر خطأ `TELEGRAM_WEBHOOK_SECRET` أضف سراً عشوائياً 16 حرفاً على الأقل، ثم أعد تشغيل Space.
+- إذا ظهر `InvalidToken` راجع توكن BotFather.
+- افحص `https://YOUR-SPACE.hf.space/health`؛ يجب أن يظهر `telegram.configured=true` و`connected=true` بعد نجاح التسجيل.
+- لا تشغّل `python bot.py` بنفس التوكن على جهازك أثناء تشغيل Webhook على Space.
+
+> كان الخلل السابق أن Gradio ينشئ تطبيق FastAPI جديداً داخل `launch()`، فتضيع المسارات المسجلة على `demo.app` قبل الإطلاق. الإصلاح يمرّر lifespan إلى التطبيق الفعلي الذي يخدم الطلبات.
+
 ## مكتبة المالك
 
 1. افتح محادثة **خاصة** مع البوت من حساب تليجرام رقم `5231453921`.
