@@ -17,7 +17,7 @@ class ImageSessions:
     def __init__(self, capacity: int = 32, ttl: int = 1800):
         self.capacity, self.ttl = capacity, ttl
         self._items: OrderedDict[tuple[int, int], tuple[bytes, float, bool]] = OrderedDict()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def put(self, key: tuple[int, int], image: bytes) -> None:
         with self._lock:

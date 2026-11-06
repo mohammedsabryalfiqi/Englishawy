@@ -64,7 +64,7 @@ class TelegramBridge:
         try:
             await self.application.bot.set_webhook(
                 url=self.base_url + WEBHOOK_PATH, secret_token=self.secret,
-                allowed_updates=["message", "callback_query"], drop_pending_updates=False,
+                allowed_updates=["message", "callback_query"], drop_pending_updates=True,
                 max_connections=40,
             )
             self.started = True
