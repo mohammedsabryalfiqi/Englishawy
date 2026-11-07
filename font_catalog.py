@@ -1,4 +1,21 @@
-"""One searchable catalog: cached Google fonts + freshly uploaded owner faces."""
+"""One searchable catalog: cached Google fonts + freshly uploaded owner faces.
+
+v7 — the full library is ALWAYS searchable.
+
+The old mirror treated "not copied to local disk yet" as "not in the library":
+`fonts()` silently dropped every owner face whose mirror copy had not finished,
+so a search right after a restart ran against a partial library (e.g. 2001 of
+8131 faces) and answered with wrong names. Now every owner face keeps a usable
+path at all times:
+
+* mirrored copy (fast), else
+* the original file on the network volume (correct, just slower).
+
+At startup `warm()` copies the library to local disk in the background; the bot
+waits for that copy (bounded) before the first search and shows honest progress
+instead of a warning. Nothing is ever dropped and a failed copy is retried on
+the next warm instead of poisoning the face for the rest of the process.
+"""
 from __future__ import annotations
 
 import json
@@ -7,6 +24,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -18,12 +36,15 @@ logger = logging.getLogger(__name__)
 
 # مكتبة المالك تعيش على Volume شبكي (/data): كل open/stat هناك بطيء، فمسح آلاف الخطوط منه
 # كان "يعلق" بلا CPU ولا رام. نخلق نسخة محلية سريعة (قرص الحاوية) في الخلفية بعدة خيوط
-# (الانتظار I/O فيتوازى)، والمسح يقرأ من النسخة المحلية فقط.
+# (الانتظار I/O فيتوازى)، والمسح يقرأ من النسخة المحلية أولاً.
 MIRROR_DIR = Path(os.getenv("ENGLISHAWY_LOCAL_MIRROR", str(Path(tempfile.gettempdir()) / "englishawy-mirror")))
-MIRROR_WORKERS = max(1, int(os.getenv("MIRROR_WORKERS", "16")))
+MIRROR_WORKERS = max(1, int(os.getenv("MIRROR_WORKERS", "32")))
 MIRROR_ENABLED = os.getenv("MIRROR_OWNER_FONTS", "1").lower() not in {"0", "false", "no"}
 MIRROR_MIN_FREE = 512 * 1024 * 1024
 MIRROR_SYNC_LIMIT = int(os.getenv("MIRROR_SYNC_LIMIT", "200"))  # أقل من هذا العدد: انسخ فوراً وانتظر
+# أقصى انتظار قبل أول بحث بعد التشغيل. بعدها يستمر النسخ في الخلفية والبحث
+# يستخدم مسارات الملفات الأصلية (نتيجة صحيحة، أبطأ قليلاً).
+MIRROR_WAIT_S = max(0.0, float(os.getenv("MIRROR_WAIT_S", "180")))
 
 
 class FontCatalog:
@@ -34,9 +55,16 @@ class FontCatalog:
         self._google_stamp = None
         self._mirror_lock = threading.Lock()
         self._mirrored: dict[str, str] = {}      # content_sha -> local path
+        self._mirror_fallback: dict[str, str] = {}  # content_sha -> original path (never dropped)
         self._mirror_failed: set[str] = set()
         self._mirror_busy = False
         self._mirror_total = 0
+        self._mirror_started = 0.0
+        self._mirror_finished = 0.0
+        # A boot-time wait happens once: if the copy is still running after the
+        # bounded wait, the following searches must not each pay that wait
+        # again. A new large batch (e.g. a GitHub import) re-arms it.
+        self._waited = False
 
     # ---- local mirror -----------------------------------------------------
     def _mirror_target(self, entry: dict) -> Path:
@@ -56,10 +84,16 @@ class FontCatalog:
                 os.replace(part, target)
             with self._mirror_lock:
                 self._mirrored[sha] = str(target)
+                self._mirror_fallback.pop(sha, None)
         except Exception as exc:
-            logger.warning("mirror failed for one font: %s", type(exc).__name__)
+            # لا نُسقط الخط من البحث: نُبقيه على مساره الأصلي حتى ولو كان القرص
+            # المحلي ممتلئاً. النسخة المحلية تحسين سرعة، وليست شرطاً للنتيجة.
+            logger.warning("mirror failed for one font (%s) — using its original path", type(exc).__name__)
             with self._mirror_lock:
                 self._mirror_failed.add(sha)
+                original = str(entry.get("path") or "")
+                if original:
+                    self._mirror_fallback[sha] = original
 
     def _mirror_worker(self, todo: list[dict]) -> None:
         try:
@@ -70,8 +104,9 @@ class FontCatalog:
         finally:
             with self._mirror_lock:
                 self._mirror_busy = False
+                self._mirror_finished = time.monotonic()
 
-    def warm(self, owner_entries: list[dict] | None = None) -> None:
+    def warm(self, owner_entries: list[dict] | None = None, retry_failed: bool = False) -> None:
         """Start (single-flight) background copying of owner fonts that are not local yet."""
         if not MIRROR_ENABLED:
             return
@@ -83,16 +118,24 @@ class FontCatalog:
                 if not sha or sha in seen:
                     continue
                 seen.add(sha)
-                if sha in self._mirrored or sha in self._mirror_failed:
+                if sha in self._mirrored:
                     continue
-                if self._mirror_target(e).exists():       # قرص محلي: stat سريع
-                    self._mirrored[sha] = str(self._mirror_target(e))
+                if sha in self._mirror_failed and not retry_failed:
+                    continue
+                target = self._mirror_target(e)
+                if target.exists():       # قرص محلي: stat سريع
+                    self._mirrored[sha] = str(target)
+                    self._mirror_fallback.pop(sha, None)
                     continue
                 todo.append(e)
-            self._mirror_total = len(seen)
+            self._mirror_total = max(self._mirror_total, len(seen))
             if not todo or self._mirror_busy:
+                if not todo and not self._mirror_busy and self._mirror_total:
+                    self._mirror_finished = time.monotonic()
                 return
             self._mirror_busy = True
+            self._mirror_started = time.monotonic()
+            self._waited = False      # new work: the next search waits for it once
         if len(todo) <= MIRROR_SYNC_LIMIT:
             self._mirror_worker(todo)   # دفعة صغيرة (رفع خط/ZIP صغير): جاهزة قبل أن نكمل
             return
@@ -101,6 +144,45 @@ class FontCatalog:
     def mirror_progress(self) -> tuple[int, int]:
         with self._mirror_lock:
             return len(self._mirrored), max(self._mirror_total, len(self._mirrored))
+
+    def mirror_available(self) -> tuple[int, int]:
+        """Faces searchable right now (mirrored + still on their original path)."""
+        with self._mirror_lock:
+            return (len(self._mirrored) + len(self._mirror_fallback),
+                    max(self._mirror_total, len(self._mirrored) + len(self._mirror_fallback)))
+
+    def wait_until_ready(self, timeout: float | None = None, progress=None, interval: float = 1.0) -> tuple[int, int]:
+        """Block (call from a worker thread) until the mirror is done or timeout.
+
+        Returns the final ``(ready, total)``. Stops early when the worker is no
+        longer running, so a failed face does not force the caller to wait the
+        whole timeout.
+        """
+        if not MIRROR_ENABLED:
+            return (0, 0)
+        with self._mirror_lock:
+            if self._waited and not self._mirror_busy:
+                ready = len(self._mirrored)
+                return ready, max(self._mirror_total, ready)
+        deadline = time.monotonic() + (MIRROR_WAIT_S if timeout is None else max(0.0, timeout))
+        while True:
+            ready, total = self.mirror_progress()
+            if progress is not None:
+                try:
+                    progress(ready, total)
+                except Exception:  # progress UI must never break the wait
+                    pass
+            if total == 0 or ready >= total or time.monotonic() >= deadline:
+                with self._mirror_lock:
+                    self._waited = True
+                return ready, total
+            with self._mirror_lock:
+                busy = self._mirror_busy
+            if not busy:
+                with self._mirror_lock:
+                    self._waited = True
+                return ready, total
+            time.sleep(interval)
 
     def _google_entries(self) -> list[dict]:
         index = FONTS_DIR / "index.json"
@@ -133,15 +215,27 @@ class FontCatalog:
         if MIRROR_ENABLED and owner:
             self.warm(owner)
             with self._mirror_lock:
-                local = dict(self._mirrored)
-            # الجاهز محلياً فقط يدخل المسح؛ الباقي يُنسخ في الخلفية (لا ننتظر Volume بطيء)
-            owner = [{**e, "path": local[e["content_sha"]]} for e in owner if e.get("content_sha") in local]
+                mirrored = dict(self._mirrored)
+                fallback = dict(self._mirror_fallback)
+            resolved: list[dict] = []
+            for e in owner:
+                sha = e.get("content_sha") or ""
+                # الترتيب: نسخة محلية → الملف الأصلي → أي مسار مسجّل في الفهرس.
+                path = mirrored.get(sha) or fallback.get(sha) or e.get("path")
+                if path:
+                    resolved.append({**e, "path": path})
+                else:
+                    logger.warning("owner face has no usable path; skipped")
+            owner = resolved
         return owner + google
 
     def stats(self) -> dict:
         owner = self.store.stats()
         ready, total = self.mirror_progress()
+        available, _ = self.mirror_available()
         owner["mirrored"], owner["mirror_total"] = ready, total
+        owner["available"] = available
+        owner["mirror_busy"] = self._mirror_busy
         return {"google": len(self._google_entries()), "owner": owner}
 
     def invalidate(self) -> None:

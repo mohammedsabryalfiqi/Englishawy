@@ -38,6 +38,7 @@ import assets_runtime
 from diag import dump_threads
 from comparison_card import render_card
 from config import FONT_SUFFIXES, admin_telegram_ids, is_admin, is_owner, owner_telegram_id, reply_delay_seconds, storage_status, whatfontis_api_key
+from font_catalog import MIRROR_WAIT_S
 from font_store import format_import_report
 from github_ingestor import parse_github_url
 from pipeline import Identification, identify
@@ -75,6 +76,58 @@ def _owner(update: Update) -> bool:
 def _admin(update: Update) -> bool:
     chat, user = update.effective_chat, update.effective_user
     return bool(chat and user and is_admin(user.id, chat.id, chat.type))
+
+
+# ---- وضع الصيانة -----------------------------------------------------------
+def _maintenance(services) -> object | None:
+    return getattr(services, "maintenance", None)
+
+
+def _maintenance_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True when the visitor should get the maintenance notice instead of service."""
+    services = context.bot_data.get("services") if context is not None else None
+    flag = _maintenance(services) if services is not None else None
+    if flag is None or not flag.is_on():
+        return False
+    return not _admin(update)          # the owner/admins keep working and can switch it off
+
+
+async def _maintenance_notice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    services = _services(context)
+    message = (_maintenance(services).message() if _maintenance(services) else
+               "🛠️ البوت في وضع الصيانة مؤقتاً — هيرجع بعد شوية.")
+    callback = getattr(update, "callback_query", None)
+    if callback is not None:
+        try:
+            await callback.answer(message[:195], show_alert=True)
+        except TelegramError:
+            pass
+        return
+    target = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    if target is not None:
+        try:
+            await target.reply_text(message)
+        except TelegramError:
+            pass
+
+
+def _maintenance_text(services) -> str:
+    flag = _maintenance(services)
+    if flag is None:
+        return "⚠️ وضع الصيانة غير مهيأ على الخادم."
+    state = "شغّال 🛠️ — أي حد يجرّب البوت هيشوف رسالة الصيانة." if flag.is_on() else "متوقف ✅ — البوت بيرد عادي."
+    return (f"وضع الصيانة: {state}\n\n"
+            f"الرسالة اللي بتظهر للمستخدمين:\n{flag.message()}\n\n"
+            "تقدر تكتب رسالة مخصصة: /maintenance on نص الرسالة")
+
+
+def _maintenance_keyboard(services) -> InlineKeyboardMarkup:
+    flag = _maintenance(services)
+    if flag is not None and flag.is_on():
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ رجّع البوت للعمل", callback_data="maint:off", style="success")]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛠️ تشغيل وضع الصيانة", callback_data="maint:on", style="danger")]])
 
 
 def _keyboard(token: str) -> InlineKeyboardMarkup:
@@ -172,27 +225,87 @@ async def threads_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(("🧵 Threads:\n" + dump_threads())[:4000])
 
 
+async def _safe_edit(message, text: str) -> None:
+    """Edit a status message, ignoring Telegram's «message is not modified» and friends."""
+    try:
+        await message.edit_text(text)
+    except TelegramError:
+        pass
+
+
+async def _ensure_library_ready(services: Services, status, base_text: str) -> None:
+    """Give the local mirror a bounded head start and show honest progress.
+
+    Every owner face is searchable from the moment the bot answers — an
+    un-mirrored face is read from its original path. The mirror only makes
+    those reads fast, so we wait for it up to ``MIRROR_WAIT_S`` (2 minutes by
+    default, i.e. the user's own suggestion) and then search regardless
+    instead of warning that results come from a partial library.
+    """
+    catalog = services.catalog
+    if not hasattr(catalog, "wait_until_ready"):
+        return
+    try:
+        await asyncio.to_thread(catalog.warm)
+        ready, total = catalog.mirror_progress()
+    except Exception:
+        return
+    if total <= 0 or ready >= total:
+        return
+    loop = asyncio.get_running_loop()
+    last = {"at": 0.0}
+
+    def on_progress(done: int, count: int) -> None:
+        if count <= 0 or done >= count:
+            return
+        now = time.monotonic()
+        if now - last["at"] < 3:  # Telegram throttles edits; 3s reads as live enough
+            return
+        last["at"] = now
+        text = (f"📚 بجهّز المكتبة كاملة على القرص المحلي ({done}/{count})...\n"
+                f"ثوانٍ وتظهر النتيجة، وبعدها كل الخطوط جاهزة على طول.")
+        try:
+            asyncio.run_coroutine_threadsafe(_safe_edit(status, text), loop).result(timeout=10)
+        except Exception:  # a status edit must never break the search
+            pass
+
+    try:
+        await asyncio.to_thread(catalog.wait_until_ready, MIRROR_WAIT_S, on_progress)
+    except Exception:
+        logger.warning("mirror wait ended early; searching with what is ready")
+    try:
+        await _safe_edit(status, base_text)
+    except Exception:
+        pass
+
+
 async def _identify_async(services: Services, image: bytes, mode: str, text: str | None,
-                          owner_only: bool = False, cancel: threading.Event | None = None) -> Identification:
-    fonts = await asyncio.to_thread(services.catalog.fonts, "owner" if owner_only else "all")
-    ready, total = services.catalog.mirror_progress() if hasattr(services.catalog, "mirror_progress") else (0, 0)
+                          owner_only: bool = False, local_only: bool = False,
+                          deep: bool = False,
+                          cancel: threading.Event | None = None) -> Identification:
+    # `owner_only` restricts the search to the owner library; `local_only`
+    # searches the owner library AND Google without calling the external site.
+    source = "owner" if owner_only else "all"
+    fonts = await asyncio.to_thread(services.catalog.fonts, source)
     async with services.analysis_semaphore:
         result = await asyncio.to_thread(identify, image, top_n=MAX_RESULTS, candidates=CANDIDATES,
                                        force_invert=mode == "invert", force_binarize=mode == "binarize",
                                        text_override=text, font_limit=FONT_LIMIT,
-                                       fonts=fonts, external_first=not owner_only, cancel=cancel)
-    if total and ready < total:
-        result.notices.append(f"⏳ لسه بجهّز مكتبتك على القرص المحلي ({ready}/{total}) — النتيجة من الجاهز حالياً.")
+                                       fonts=fonts, external_first=not (owner_only or local_only),
+                                       cancel=cancel, deep=deep)
     return result
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _maintenance_blocked(update, context):
+        await _maintenance_notice(update, context)
+        return
     text = ("👋 ابعت صورة كلمة إنجليزية وهرجّعلك أقرب الخطوط بالمعاينة.\n"
-            "✅ صحيحة لتأكيد النتيجة · ❌ خاطئة للبحث في مكتبة المالك فقط.")
+            "✅ صحيحة لتأكيد النتيجة · ❌ خاطئة للبحث تاني في مكتبتك وخطوط Google بأعلى دقة.")
     if _owner(update):
-        text += "\n\n🔐 الإدارة: /login /owner /fonts /removefont /import_github /jobs"
+        text += "\n\n🔐 الإدارة: /login /owner /fonts /removefont /import_github /jobs /maintenance"
     elif _admin(update):
-        text += "\n\n🛠️ أوامر المدير: /help /status"
+        text += "\n\n🛠️ أوامر المدير: /help /status /maintenance"
     await update.message.reply_text(text)
 
 
@@ -201,12 +314,34 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔐 الحالة متاحة للمالك والمديرين في محادثة خاصة.")
         return
     stats = await asyncio.to_thread(_services(context).catalog.stats)
+    owner = stats["owner"]
     await update.message.reply_text(
         f"🔎 بحث خارجي ← مكتبتك ← Google\n"
         f"البحث الخارجي: {'مفتاح مضبوط' if whatfontis_api_key() else 'المفتاح غير مضبوط'}\n"
-        f"Google: {stats['google']} خط\nمكتبة المالك: {stats['owner']['faces']} وجه / {stats['owner']['families']} عائلة\n"
+        f"Google: {stats['google']} خط\nمكتبة المالك: {owner['faces']} وجه / {owner['families']} عائلة\n"
+        f"📚 جاهز للبحث الآن: {owner.get('available', owner['faces'])}/{owner.get('mirror_total') or owner['faces']} وجه"
+        f"{' (بيكمل في الخلفية)' if owner.get('mirror_busy') else ''}\n"
+        f"🛠️ وضع الصيانة: {'شغّال' if _maintenance(_services(context)) and _maintenance(_services(context)).is_on() else 'متوقف'}\n"
         f"⏱️ وقت الرد المضبوط: {reply_delay_seconds():.0f} ثانية على الأقل\n"
         f"{storage_status()['label']}")
+
+
+async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _admin(update):
+        await update.message.reply_text("🔐 التحكم في وضع الصيانة متاح للمالك والمديرين في محادثة خاصة.")
+        return
+    services = _services(context)
+    flag = _maintenance(services)
+    if flag is None:
+        await update.message.reply_text("⚠️ وضع الصيانة غير مهيأ على الخادم.")
+        return
+    args = [str(a) for a in (context.args or [])]
+    action = args[0].lower() if args else ""
+    if action == "on":
+        flag.enable(" ".join(args[1:]).strip())
+    elif action == "off":
+        flag.disable()
+    await update.message.reply_text(_maintenance_text(services), reply_markup=_maintenance_keyboard(services))
 
 
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,7 +447,8 @@ async def _start_github_from_text(update: Update, context: ContextTypes.DEFAULT_
 
 async def _analyze_and_respond(update: Update, context: ContextTypes.DEFAULT_TYPE, status,
                                image: bytes, mode: str, text: str | None, token: str,
-                               owner_only: bool = False, started: float | None = None):
+                               owner_only: bool = False, started: float | None = None,
+                               local_only: bool = False, deep: bool = False):
     services = _services(context)
     key = _key(update)
     if key is None or not services.sessions.begin(key, token):
@@ -321,14 +457,22 @@ async def _analyze_and_respond(update: Update, context: ContextTypes.DEFAULT_TYP
     started = time.monotonic() if started is None else started
     delay = reply_delay_seconds()
     cancel = threading.Event()
-    task = asyncio.create_task(_identify_async(services, image, mode, text, owner_only, cancel=cancel))
+    searching = ("📚 بفحص مكتبتك وخطوط Google بأعلى دقة..." if local_only
+                 else "🔎 بفحص الصورة ومراجعة الخطوط...")
     result = None
+    task: asyncio.Task | None = None
     try:
-        await status.edit_text("🔎 بفحص الصورة ومراجعة الخطوط..." if not owner_only else "📚 بفحص مكتبة المالك فقط...")
+        # The mirror wait happens before the timing clock below: preparing the
+        # library must not eat into the search timeout.
+        await _ensure_library_ready(services, status, searching)
+        await _safe_edit(status, searching)
+        task = asyncio.create_task(_identify_async(services, image, mode, text, owner_only,
+                                                   local_only=local_only, deep=deep, cancel=cancel))
+        identify_started = time.monotonic()
         dumped = False
         while not task.done():
             done, _ = await asyncio.wait({task}, timeout=4)
-            elapsed = time.monotonic() - started
+            elapsed = time.monotonic() - identify_started
             if not done and elapsed > SLOW_DUMP_S and not dumped:
                 dumped = True  # مرة واحدة: يبيّن في اللوج أين يقف التحليل
                 logger.warning("Analysis still running after %.0fs. Threads:\n%s", elapsed, dump_threads())
@@ -361,13 +505,18 @@ async def _analyze_and_respond(update: Update, context: ContextTypes.DEFAULT_TYP
         await status.edit_text("⚠️ تعذر التحليل. جرّب صورة أوضح أو تأكد من تجهيز المكتبة.")
         return
     finally:
-        if not task.done():
+        if task is not None and not task.done():
             cancel.set()  # يوقف خيط المسح الفعلي؛ task.cancel وحده لا يوقفه
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        services.sessions.finish(key, token, result.text if result else (text or ""), owner_only, result=result)
+        # `owner_only` on the session records "the last search skipped the
+        # external site" — true for the ❌ re-search, which reads the owner
+        # library and Google together.
+        services.sessions.finish(key, token, result.text if result else (text or ""),
+                                 owner_only or local_only, result=result)
     if not result.text or not result.matches:
-        message = ("📚 مكتبة المالك فارغة أو مافيها نتيجة مطابقة. ابعت صورة أوضح." if owner_only
+        message = ("📚 مفيش نتيجة مطابقة في مكتبتك وخطوط Google. ابعت صورة أوضح أو أضف الخطوط للمكتبة." if local_only
+                   else "📚 مكتبة المالك فارغة أو مافيها نتيجة مطابقة. ابعت صورة أوضح." if owner_only
                    else "⚠️ لم أجد نصاً/خطاً واضحاً. جرّب قصّ الكلمة بصورة أوضح.")
         await status.edit_text(message)
         return
@@ -406,11 +555,17 @@ async def _receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _maintenance_blocked(update, context):
+        await _maintenance_notice(update, context)
+        return
     photo = update.message.photo[-1]
     await _receive_image(update, context, await photo.get_file(), photo.file_size)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _maintenance_blocked(update, context):
+        await _maintenance_notice(update, context)
+        return
     document = update.message.document
     if not document:
         return
@@ -457,6 +612,9 @@ async def login_hint(update: Update):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _maintenance_blocked(update, context):
+        await _maintenance_notice(update, context)
+        return
     incoming = (update.message.text or "").strip()
     # After "✏️ الكلمة غلط", the next plain message is the corrected word.
     fix = context.user_data.pop("word_fix", None) if context.user_data else None
@@ -517,11 +675,47 @@ async def _apply_word_fix(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
     await chat.send_photo(photo=io.BytesIO(card), caption=caption, reply_markup=_keyboard(state.token))
 
 
+async def _handle_maintenance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> None:
+    """The /maintenance keyboard: the owner flips the gate without typing a command."""
+    query = update.callback_query
+    services = _services(context)
+    flag = _maintenance(services)
+    if flag is None:
+        await query.answer("⚠️ وضع الصيانة غير مهيأ على الخادم.", show_alert=True)
+        return
+    if not _admin(update):
+        await query.answer("🔐 التحكم في وضع الصيانة متاح للمالك والمديرين.", show_alert=True)
+        return
+    if action == "on":
+        flag.enable()                  # a custom notice set earlier is kept
+        await query.answer("🛠️ وضع الصيانة اتشغّل — أي مستخدم هيشوف رسالة الصيانة.")
+    elif action == "off":
+        flag.disable()
+        await query.answer("✅ وضع الصيانة اتوقف — البوت رجع يرد عادي.")
+    else:
+        await query.answer()
+    try:
+        await query.message.edit_text(_maintenance_text(services),
+                                      reply_markup=_maintenance_keyboard(services))
+    except TelegramError:
+        pass
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     key = _key(update)
     data = (query.data if query else "") or ""
     kind, _, rest = data.partition(":")
+    # The maintenance switch is resolved before any image session: the flag has
+    # to answer even after a restart, when no session exists any more.
+    if kind == "maint":
+        if query is None:
+            return
+        await _handle_maintenance_callback(update, context, rest)
+        return
+    if _maintenance_blocked(update, context):
+        await _maintenance_notice(update, context)
+        return
     token = rest.split(":")[0] if rest else ""
     state = _services(context).sessions.state(key, token) if key and token else None
     if not query or not query.message or state is None:
@@ -581,26 +775,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     action = rest.partition(":")[2]
     if action == "correct":
+        # A confirmed result needs no further buttons — drop the whole row.
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
         await query.answer("✅ تم تأكيد النتيجة.")
         return
     if action != "wrong":
         await query.answer()
         return
-    if state.owner_only:
-        await query.answer("دي بالفعل نتائج مكتبة المالك. جرّب صورة أوضح أو أضف خطوطاً للمكتبة.", show_alert=True)
-        return
     if state.busy:
         await query.answer("⏳ استنى نتيجة التحليل الحالي.")
         return
-    await query.answer("📚 هبحث في مكتبة المالك فقط.")
+    if state.owner_only:
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        await query.answer("🔎 دي بالفعل أحدث نتيجة من مكتبتك وخطوط Google.", show_alert=True)
+        return
+    await query.answer("🔎 ببحث تاني في مكتبتك وخطوط Google بأعلى دقة...")
     try:
         await query.message.edit_reply_markup(reply_markup=None)
     except TelegramError:
         pass
-    status = await query.message.reply_text("📚 تركت نتائج المواقع؛ جاري فحص مكتبة المالك...")
-    # Reuse the OCR text from the rejected card, without calling either website.
+    status = await query.message.reply_text("🔎 ببحث في مكتبتك وخطوط Google بأعلى دقة...")
+    # Same OCR text, no external site: owner library + Google, deep refinement.
     await _analyze_and_respond(update, context, status, state.image, "auto", state.text or None,
-                               state.token, owner_only=True)
+                               state.token, local_only=True, deep=True)
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -613,7 +816,8 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 PUBLIC_COMMANDS: list[tuple[str, str]] = []
-ADMIN_COMMANDS = [("start", "بدء استخدام البوت"), ("help", "طريقة الاستخدام"), ("status", "حالة المكتبة والبحث")]
+ADMIN_COMMANDS = [("start", "بدء استخدام البوت"), ("help", "طريقة الاستخدام"),
+                  ("status", "حالة المكتبة والبحث"), ("maintenance", "تشغيل/إيقاف وضع الصيانة")]
 OWNER_COMMANDS = ADMIN_COMMANDS + [
     ("login", "كود دخول لوحة المالك"), ("owner", "حالة مكتبة المالك"),
     ("fonts", "عرض الخطوط"), ("removefont", "حذف خط بالرقم"),
@@ -652,6 +856,17 @@ async def post_init(application: Application) -> None:
         # Menu visibility is cosmetic; handler authorization is not. A transient
         # Telegram API failure here must not prevent polling from answering users.
         logger.warning("Telegram command menus could not be fully configured; authorization remains enforced")
+    services = application.bot_data.get("services")
+    catalog = getattr(services, "catalog", None)
+    if catalog is not None and hasattr(catalog, "warm"):
+        # Start copying the owner library to local disk right away, in a worker
+        # thread: by the time the first visitor sends an image most of the
+        # library is local and the search is fast. Never blocks startup — a
+        # search that arrives earlier waits for the copy itself (bounded).
+        try:
+            asyncio.create_task(asyncio.to_thread(catalog.warm))
+        except (RuntimeError, AttributeError):
+            logger.warning("library warm-up could not start; the first search will prepare it")
 
 
 def register_handlers(application: Application, services: Services) -> None:
@@ -659,7 +874,8 @@ def register_handlers(application: Application, services: Services) -> None:
     for command, handler in [("start", start), ("help", start), ("status", status_command),
                              ("login", login), ("owner", owner_status), ("fonts", list_fonts),
                              ("removefont", remove_font), ("import_github", import_github),
-                             ("jobs", jobs_command), ("threads", threads_command)]:
+                             ("jobs", jobs_command), ("threads", threads_command),
+                             ("maintenance", maintenance_command)]:
         application.add_handler(CommandHandler(command, handler))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))

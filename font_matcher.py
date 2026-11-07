@@ -263,6 +263,14 @@ CHUNK_TIMEOUT_S = float(os.getenv("MATCH_CHUNK_TIMEOUT_S", "180"))
 USE_SUBPROCESS = os.getenv("MATCH_SUBPROCESS", "1").lower() not in {"0", "false", "no"}
 _WORKER = Path(__file__).resolve().with_name("font_scan_worker.py")
 
+# ---- وضع البحث العميق (زر «❌ خاطئة») -------------------------------------
+# مرحلة إضافية تُشغَّل على أفضل المرشحين فقط: نفس الخط يُرسم بحجمين وبحالات
+# الأحرف المحتملة (OCR كثيراً ما يخطئ في حالة الأحرف)، وتُختار أفضل درجة.
+# تكلّف ثوانٍ معدودة وترفع دقة الترتيب دون المساس بزمن البحث العادي.
+DEEP_KEEP_MIN = int(os.getenv("MATCH_DEEP_KEEP_MIN", "360"))
+DEEP_REFINE_TOP = int(os.getenv("MATCH_DEEP_REFINE_TOP", "40"))
+DEEP_SIZES = (160, 112)
+
 
 def coarse_entry(entry: dict, text: str, signature, max_mb: float = MAX_FONT_MB) -> float | None:
     """Cheap score for ONE font (small render, never cached). None = cannot render / too big."""
@@ -291,6 +299,58 @@ def _coarse_chunk_subprocess(batch: list[dict], text: str, ref_hex: str) -> list
         return None
 
 
+def _best_full(ref_img: Image.Image, font_path: str, text: str, face_index: int,
+               deep: bool = False) -> tuple[float, dict] | None:
+    """Full metric pass for one face, over one render size (deep: two sizes)."""
+    best: tuple[float, dict] | None = None
+    for size in (DEEP_SIZES if deep else (160,)):
+        cand = render_text(font_path, text, size=size, face_index=face_index)
+        if cand is None:
+            continue
+        score, metrics = score_pair(ref_img, cand)
+        if best is None or score > best[0]:
+            best = (score, metrics)
+    return best
+
+
+def _case_variants(text: str) -> list[str]:
+    """Letter cases OCR may have got wrong; two at most to bound the cost."""
+    out: list[str] = []
+    for variant in (text.upper(), text.lower(), text.title()):
+        if variant and variant != text and variant not in out:
+            out.append(variant)
+    return out[:2]
+
+
+def _deep_refine(ref_img: Image.Image, text: str, results: list[FontMatch],
+                 cancel: threading.Event | None = None) -> None:
+    """Re-score the leading candidates under alternate letter cases and sizes.
+
+    The reference image is a real screenshot; the OCR text behind it may differ
+    in case only (``Baby`` read as ``baby``). One fixed case can sink the right
+    font below a worse one that happens to match the typo, so each of the top
+    candidates is retried and keeps its best score. Mutates ``results`` in place.
+    """
+    variants = _case_variants(text)
+    if not variants:
+        return
+    for match in results[:DEEP_REFINE_TOP]:
+        if cancel is not None and cancel.is_set():
+            return
+        for variant in variants:
+            for size in DEEP_SIZES:
+                cand = render_text(match.font_path, variant, size=size, face_index=match.face_index)
+                if cand is None:
+                    continue
+                score, m = score_pair(ref_img, cand)
+                if score > match.score:
+                    match.score = score
+                    match.iou = m["iou"]
+                    match.aspect_diff = m["aspect_diff"]
+                    match.weight_diff = m["weight_diff"]
+                    match.edge_sim = m["edge_sim"]
+
+
 def match_fonts(
     ref_img: Image.Image,
     text: str,
@@ -300,6 +360,7 @@ def match_fonts(
     fonts: list[dict] | None = None,
     cancel: threading.Event | None = None,
     stats: dict | None = None,
+    deep: bool = False,
 ) -> tuple[list[FontMatch], int]:
     index = fonts if fonts is not None else load_index()
     if limit and fonts is None:
@@ -354,15 +415,19 @@ def match_fonts(
 
     shortlisted.sort(key=lambda item: item[0], reverse=True)
     # سقف القائمة القصيرة: كافٍ لالتقاط أفضل المرشحين لكل نمط، وقليل بما
-    # يكفي لجعل المقارنة الكاملة سريعة. لا يقلّ عن 120 حتى لمكتبة صغيرة.
-    keep = min(len(shortlisted), max(4 * max(1, top_k), 120))
+    # يكفي لجعل المقارنة الكاملة سريعة. البحث العميق (زر «❌ خاطئة») يوسّعها
+    # إلى 360 ويُرسم بحجمين، فيصعد الخط الصحيح حتى لو كان ترتيبه الخشن متوسطاً.
+    keep = min(len(shortlisted), max((10 if deep else 6) * max(1, top_k),
+                                     max(DEEP_KEEP_MIN, 200) if deep else 200))
 
     results: list[FontMatch] = []
     for coarse, entry, path, face_index in shortlisted[:keep]:
-        cand = render_text(path, text, face_index=face_index)
-        if cand is None:
+        if cancel is not None and cancel.is_set():
+            break
+        best = _best_full(ref_img, path, text, face_index, deep=deep)
+        if best is None:
             continue
-        score, m = score_pair(ref_img, cand)
+        score, m = best
         results.append(
             FontMatch(
                 slug=entry["slug"],
@@ -380,4 +445,9 @@ def match_fonts(
             )
         )
     results.sort(key=lambda x: x.score, reverse=True)
+    if deep:
+        _deep_refine(ref_img, text, results, cancel)
+        results.sort(key=lambda x: x.score, reverse=True)
+        if stats is not None:
+            stats["deep"] = {"keep": keep, "refined": min(len(results), DEEP_REFINE_TOP)}
     return results[:top_k], total

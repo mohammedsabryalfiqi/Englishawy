@@ -167,6 +167,7 @@ def identify(
     neural_backend: Callable[[np.ndarray, np.ndarray], list[float]] | None = None,
     external_first: bool = True,
     cancel: threading.Event | None = None,
+    deep: bool = False,
 ) -> Identification:
     if not 1 <= int(top_n) <= 10 or not 1 <= int(candidates) <= 64:
         raise ValueError("Invalid result/candidate count")
@@ -205,7 +206,7 @@ def identify(
         t0 = time.time()
         found, total = match_fonts(prep.reference_crop, ocr.text, top_k=candidates,
                                    limit=font_limit, progress=progress, fonts=fonts,
-                                   cancel=cancel)
+                                   cancel=cancel, deep=deep)
         count = total
         timings["shape_match"] = round(time.time() - t0, 2)
         logger.info("stage library-scan done %.1fs fonts=%d", timings["shape_match"], total)

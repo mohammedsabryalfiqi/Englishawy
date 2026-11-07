@@ -18,6 +18,7 @@ from typing import Callable
 from font_catalog import FontCatalog
 from font_store import FontStore
 from github_ingestor import GithubRepoIngestor
+from maintenance import Maintenance
 from owner_auth import OwnerAuth
 
 
@@ -100,12 +101,19 @@ class Services:
     analysis_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
     ingestor: GithubRepoIngestor | None = None
     notify_callback: Callable[[str], None] | None = None  # e.g. Telegram owner notifier
+    # Persistent maintenance switch: visitors see the notice instead of an
+    # answer while the owner updates the library or restarts the Space.
+    maintenance: Maintenance = field(default_factory=Maintenance)
 
     @classmethod
     def create(cls, root: str | Path | None = None,
                notify_callback: Callable[[str], None] | None = None) -> "Services":
         store = FontStore(root)
         store.cleanup_temp()
-        svc = cls(store=store, catalog=FontCatalog(store), notify_callback=notify_callback)
+        # An explicit root (tests, local runs) keeps the flag next to that data
+        # instead of the shared volume.
+        flag = (Path(root) / "maintenance.json") if root is not None else None
+        svc = cls(store=store, catalog=FontCatalog(store), notify_callback=notify_callback,
+                  maintenance=Maintenance(flag))
         svc.ingestor = GithubRepoIngestor(store, notify_callback=notify_callback)
         return svc
