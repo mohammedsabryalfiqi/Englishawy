@@ -164,7 +164,7 @@ def test_command_menus_default_empty_and_scoped(monkeypatch):
                          ("all_group_chats", None, []), ("all_chat_administrators", None, [])]
     assert calls[4][0:2] == ("chat", 100)
     assert "start" in calls[4][2] and "removefont" in calls[4][2]
-    assert calls[5] == ("chat", 200, ["start", "help", "status"])
+    assert calls[5] == ("chat", 200, ["start", "help", "status", "maintenance"])
 
 
 def test_unreachable_admin_chat_does_not_block_command_menus(monkeypatch):
@@ -200,16 +200,18 @@ def test_wrong_button_uses_owner_library_without_external_search(tmp_path, monke
         context = SimpleNamespace(bot_data={"services": services})
         calls = []
 
-        async def fake_identify(svc, image, mode, text, owner_only=False, cancel=None):
-            calls.append((image, text, owner_only))
+        async def fake_identify(svc, image, mode, text, owner_only=False, **kwargs):
+            calls.append((image, text, owner_only, kwargs.get("local_only"), kwargs.get("deep")))
             return result(owner=True)
 
         monkeypatch.setattr(bot, "_identify_async", fake_identify)
         monkeypatch.setenv("BOT_REPLY_DELAY_SECONDS", "0")
         await bot.handle_callback(update, context)
-        assert calls == [(b"image", "welcome baby", True)]
+        # ❌ re-searches the owner library AND Google (never the external site),
+        # and deep-refines the shortlist.
+        assert calls == [(b"image", "welcome baby", False, True, True)]
         assert message.markup_removed
-        assert "مكتبة المالك" in answers[0]
+        assert "مكتبتك وخطوط Google" in answers[0]
         state = services.sessions.current((10, 10))
         assert state.owner_only and not state.busy
         assert state.text == "welcome baby"
@@ -367,5 +369,108 @@ def test_font_file_refuses_when_no_local_file_exists(tmp_path, monkeypatch):
         await bot.handle_callback(update, SimpleNamespace(bot_data={"services": services}))
         assert message.documents == []
         assert "مفيش ملف خط" in message.replies[-1][0]
+
+    asyncio.run(run())
+
+
+def test_correct_button_removes_the_buttons(tmp_path, monkeypatch):
+    async def run():
+        services = Services.create(tmp_path)
+        token = services.sessions.put((10, 10), b"image")
+        services.sessions.finish((10, 10), token, "welcome baby", False, result=result())
+        message = Message()
+        answers = []
+
+        async def answer(text="", **kwargs):
+            answers.append(text)
+
+        query = SimpleNamespace(data=f"vote:{token}:correct", message=message, answer=answer)
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=10),
+                                 effective_chat=SimpleNamespace(id=10, type="private"))
+        context = SimpleNamespace(bot_data={"services": services})
+
+        async def no_search(*args, **kwargs):
+            raise AssertionError("✅ must not start another search")
+
+        monkeypatch.setattr(bot, "_identify_async", no_search)
+        await bot.handle_callback(update, context)
+        assert message.markup_removed
+        assert answers and "تم تأكيد" in answers[0]
+
+    asyncio.run(run())
+
+
+def test_maintenance_gate_blocks_visitors_and_lets_the_admin_through(tmp_path, monkeypatch):
+    async def run():
+        monkeypatch.setenv("OWNER_TELEGRAM_ID", "100")
+        monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "")
+        services = Services.create(tmp_path)
+        services.maintenance.enable()
+
+        def private(user_id):
+            message = Message()
+            message.text = "hello"
+            return SimpleNamespace(message=message, effective_message=message,
+                                   effective_user=SimpleNamespace(id=user_id),
+                                   effective_chat=SimpleNamespace(id=user_id, type="private"))
+
+        context = SimpleNamespace(bot_data={"services": services}, user_data={})
+        visitor = private(10)
+        await bot.handle_text(visitor, context)
+        assert len(visitor.message.replies) == 1
+        assert "الصيانة" in visitor.message.replies[0][0]
+
+        owner = private(100)
+        await bot.handle_text(owner, context)
+        assert owner.message.replies and "صورة" in owner.message.replies[0][0]
+
+    asyncio.run(run())
+
+
+def test_maintenance_keyboard_toggles_the_persistent_flag(tmp_path, monkeypatch):
+    async def run():
+        monkeypatch.setenv("OWNER_TELEGRAM_ID", "100")
+        monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "")
+        services = Services.create(tmp_path)
+        answers = []
+
+        async def answer(text="", **kwargs):
+            answers.append((text, kwargs.get("show_alert")))
+
+        context = SimpleNamespace(bot_data={"services": services})
+        update = SimpleNamespace(
+            callback_query=SimpleNamespace(data="maint:on", message=Message(), answer=answer),
+            effective_user=SimpleNamespace(id=100),
+            effective_chat=SimpleNamespace(id=100, type="private"))
+        await bot.handle_callback(update, context)
+        assert services.maintenance.is_on()
+
+        # Another process must see the same state: the flag lives on disk.
+        assert Services.create(tmp_path).maintenance.is_on()
+
+        update.callback_query.data = "maint:off"
+        await bot.handle_callback(update, context)
+        assert not services.maintenance.is_on()
+
+    asyncio.run(run())
+
+
+def test_maintenance_callback_is_admin_only(tmp_path, monkeypatch):
+    async def run():
+        monkeypatch.setenv("OWNER_TELEGRAM_ID", "100")
+        monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "")
+        services = Services.create(tmp_path)
+        alerts = []
+
+        async def answer(text="", **kwargs):
+            alerts.append((text, kwargs.get("show_alert")))
+
+        update = SimpleNamespace(
+            callback_query=SimpleNamespace(data="maint:on", message=Message(), answer=answer),
+            effective_user=SimpleNamespace(id=10),
+            effective_chat=SimpleNamespace(id=10, type="private"))
+        await bot.handle_callback(update, SimpleNamespace(bot_data={"services": services}))
+        assert not services.maintenance.is_on()
+        assert alerts and alerts[-1][1] is True
 
     asyncio.run(run())
